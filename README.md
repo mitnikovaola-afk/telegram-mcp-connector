@@ -119,7 +119,7 @@ Cron на ноутбуці працює, лише поки компʼютер у
 **1. Сервер і код.** Вхід на сервер лише за SSH-ключем. Конектор працює від окремого користувача без sudo, а файли systemd (крок 4) створює адміністратор.
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone <repo-url> ~/telegram-mcp-connector && cd ~/telegram-mcp-connector
+git clone https://github.com/mitnikovaola-afk/telegram-mcp-connector.git ~/telegram-mcp-connector && cd ~/telegram-mcp-connector
 uv sync
 mkdir -m 700 data
 ```
