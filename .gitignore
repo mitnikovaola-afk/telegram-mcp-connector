@@ -1,0 +1,17 @@
+# Secrets and personal data — never commit
+.env
+data/
+*.session
+*.session-journal
+
+# Python / tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# Private notes and source materials — not for the repo
+CLAUDE.local.md
+private/

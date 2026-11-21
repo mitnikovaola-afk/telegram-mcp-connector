@@ -1,0 +1,32 @@
+[project]
+name = "tg-connector"
+version = "0.1.0"
+description = "MCP server: Telegram (groups + DMs) -> incremental sync -> daily LLM summaries -> Notion"
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=3.6.1",
+    "mcp>=2.3.0",
+    "notion-client>=3.1.0",
+    "pydantic>=2.14.4",
+    "python-dotenv>=1.2.4",
+    "telethon>=1.46.0",
+]
+
+[project.scripts]
+tg-connector = "tg_connector.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["tests"]
+testpaths = ["tests"]
