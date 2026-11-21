@@ -50,7 +50,7 @@ Telegram ──(тільки id > курсор)──► SQLite ──(змін�
 - Акаунт Telegram, Google-акаунт (Gemini), робочий простір Notion.
 
 ```bash
-git clone <repo-url> telegram-mcp-connector && cd telegram-mcp-connector
+git clone https://github.com/mitnikovaola-afk/telegram-mcp-connector.git && cd telegram-mcp-connector
 uv sync
 cp .env.example .env && chmod 600 .env
 ```
