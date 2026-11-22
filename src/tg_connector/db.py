@@ -109,6 +109,23 @@ CREATE TABLE IF NOT EXISTS notion_tasks (
     PRIMARY KEY (chat_id, local_date, task_key)
 );
 
+CREATE TABLE IF NOT EXISTS notion_decisions (
+    chat_id      INTEGER NOT NULL,
+    local_date   TEXT    NOT NULL,
+    decision_key TEXT    NOT NULL,
+    page_id      TEXT    NOT NULL,
+    PRIMARY KEY (chat_id, local_date, decision_key)
+);
+
+CREATE TABLE IF NOT EXISTS project_briefs (
+    project_page_id TEXT PRIMARY KEY,
+    brief_json      TEXT NOT NULL,
+    updated_on      TEXT NOT NULL,       -- local date of the last daily update
+    input_hash      TEXT NOT NULL,       -- JSON {chat_id:date -> hash}: the day versions the brief contains
+    model           TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -189,6 +206,9 @@ class Database:
 
     def get_chat(self, chat_id: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
+
+    def all_chats(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM chats ORDER BY title").fetchall()
 
     def tracked_chats(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM chats WHERE tracked = 1 ORDER BY title").fetchall()
@@ -472,14 +492,16 @@ class Database:
         params.append(limit)
         return self.conn.execute(sql, params).fetchall()
 
-    def summaries_to_export(self, render_version: str = "") -> list[sqlite3.Row]:
-        """Summaries whose Notion page is missing or outdated: the content changed (export_hash)
-        or the page layout code changed (render_version)."""
+    def summaries_to_export(self, *accepted: str) -> list[sqlite3.Row]:
+        """Summaries whose Notion page is missing or outdated: the content changed (export_hash) or the page
+        was made by a layout version that is not among the `accepted` suffixes."""
+        accepted = accepted or ("",)
+        marks = ", ".join(["s.export_hash || ?"] * len(accepted))
         return self.conn.execute(
-            """SELECT s.*, c.title, c.kind FROM summaries s JOIN chats c ON c.chat_id = s.chat_id
-               WHERE s.notion_synced_hash IS NULL OR s.notion_synced_hash != s.export_hash || ?
+            f"""SELECT s.*, c.title, c.kind FROM summaries s JOIN chats c ON c.chat_id = s.chat_id
+               WHERE s.notion_synced_hash IS NULL OR s.notion_synced_hash NOT IN ({marks})
                ORDER BY s.local_date, s.chat_id""",
-            (render_version,),
+            accepted,
         ).fetchall()
 
     def set_notion_page(self, chat_id: int, local_date: str, page_id: str, synced_hash: str | None) -> None:
@@ -488,6 +510,13 @@ class Database:
                 "UPDATE summaries SET notion_page_id = ?, notion_synced_hash = ? WHERE chat_id = ? AND local_date = ?",
                 (page_id, synced_hash, chat_id, local_date),
             )
+
+    def requeue_export(self, chat_id: int) -> int:
+        """Export all days of a chat again (e.g. its project changed); the pages are updated in place."""
+        with self.tx() as c:
+            return c.execute(
+                "UPDATE summaries SET notion_synced_hash = NULL WHERE chat_id = ? AND notion_synced_hash IS NOT NULL", (chat_id,)
+            ).rowcount
 
     def notion_tasks_for_day(self, chat_id: int, local_date: str) -> dict[str, str]:
         rows = self.conn.execute(
@@ -509,6 +538,54 @@ class Database:
                 "DELETE FROM notion_tasks WHERE chat_id = ? AND local_date = ? AND task_key = ?",
                 (chat_id, local_date, task_key),
             )
+
+    def notion_decisions_for_day(self, chat_id: int, local_date: str) -> dict[str, str]:
+        rows = self.conn.execute(
+            "SELECT decision_key, page_id FROM notion_decisions WHERE chat_id = ? AND local_date = ?", (chat_id, local_date)
+        )
+        return {r["decision_key"]: r["page_id"] for r in rows}
+
+    def save_notion_decision(self, chat_id: int, local_date: str, key: str, page_id: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO notion_decisions (chat_id, local_date, decision_key, page_id) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(chat_id, local_date, decision_key) DO UPDATE SET page_id = excluded.page_id""",
+                (chat_id, local_date, key, page_id),
+            )
+
+    def forget_notion_decision(self, chat_id: int, local_date: str, key: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "DELETE FROM notion_decisions WHERE chat_id = ? AND local_date = ? AND decision_key = ?",
+                (chat_id, local_date, key),
+            )
+
+    def count_notion_decisions(self, chat_ids: set[int]) -> int:
+        if not chat_ids:
+            return 0
+        ids = sorted(chat_ids)
+        return self.conn.execute(
+            f"SELECT count(*) FROM notion_decisions WHERE chat_id IN ({','.join('?' * len(ids))})", ids
+        ).fetchone()[0]
+
+    def get_project_brief(self, page_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM project_briefs WHERE project_page_id = ?", (page_id,)).fetchone()
+
+    def save_project_brief(self, page_id: str, brief: dict[str, Any], updated_on: str, input_hash: str, model: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO project_briefs (project_page_id, brief_json, updated_on, input_hash, model, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(project_page_id) DO UPDATE SET brief_json = excluded.brief_json,
+                       updated_on = excluded.updated_on, input_hash = excluded.input_hash, model = excluded.model,
+                       updated_at = excluded.updated_at""",
+                (page_id, json.dumps(brief, ensure_ascii=False, sort_keys=True), updated_on, input_hash, model, utcnow_iso()),
+            )
+
+    def mark_project_brief_checked(self, page_id: str, updated_on: str) -> None:
+        """Nothing new in the project's chats today: remember that the day was checked (no LLM call)."""
+        with self.tx() as c:
+            c.execute("UPDATE project_briefs SET updated_on = ? WHERE project_page_id = ?", (updated_on, page_id))
 
     # ------------------------------------------------------------------- runs
     def start_run(self, trigger: str) -> int:

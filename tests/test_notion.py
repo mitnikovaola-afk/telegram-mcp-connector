@@ -51,7 +51,8 @@ async def test_two_linked_databases_and_views_are_created_once(env):
     env.source.add(GROUP, 2, "Нове повідомлення", at(20, 11))
     await env.run()
 
-    assert [d["title"] for d in env.notion.databases_created] == ["Telegram — денні самарі", "Telegram — задачі"]
+    assert [d["title"] for d in env.notion.databases_created] == [
+        "Telegram — денні самарі", "Telegram — задачі", "Telegram — проєкти", "Telegram — рішення"]
     assert env.notion.view_names("db-1") == ["📰 Стрічка", "🗂 За чатами", "🗓 Календар", "❓ Є відкриті питання"]
     assert env.notion.view_names("db-2") == ["🔥 Відкриті задачі", "📋 Дошка", "👤 За людьми", "🗓 Дедлайни"]
     assert env.db.kv_get(KV_LAYOUT) == LAYOUT_VERSION
@@ -122,7 +123,7 @@ async def test_old_install_is_migrated_in_place(env):
 
     props = env.notion.data_sources["ds-1"]["properties"]
     assert {"Коротко", "Тип", "Виконавці", "Задач", "Рішень", "Відкритих питань", "Задачі"} <= set(props)
-    assert len(env.notion.databases_created) == 2  # the old one + the new tasks database
+    assert len(env.notion.databases_created) == 4  # the old one + tasks, projects, decisions
     assert "📰 Стрічка" in env.notion.view_names("db-1")
 
 

@@ -374,3 +374,142 @@ def build_task_properties(row: Any, item: dict[str, Any], key: str, day_page_id:
 # Back-compat names used by older tests / callers.
 build_blocks = build_day_blocks
 build_properties = build_day_properties
+
+
+# ---------------------------------------------------------------- projects (beyond the task)
+
+PROJECTS_TITLE = "Telegram — проєкти"
+DECISIONS_TITLE = "Telegram — рішення"
+PROJECT_ACTIVE, PROJECT_PAUSED, PROJECT_DONE = "Активний", "На паузі", "Завершено"
+# Columns the USER owns on a project (set once on creation, never overwritten by the connector).
+PROJECT_USER_COLUMNS = ("Проєкт", "Чати", "Статус", "Дата релізу")
+
+
+def project_properties_schema() -> dict[str, Any]:
+    return {
+        "Проєкт": {"title": {}},
+        "Чати": {"multi_select": {}},
+        "Статус": {
+            "select": {
+                "options": [
+                    {"name": PROJECT_ACTIVE, "color": "green"},
+                    {"name": PROJECT_PAUSED, "color": "yellow"},
+                    {"name": PROJECT_DONE, "color": "gray"},
+                ]
+            }
+        },
+        "Дата релізу": {"date": {}},
+        "Бриф оновлено": {"date": {}},
+        "Відкритих задач": {"number": {"format": "number"}},
+        "Рішень": {"number": {"format": "number"}},
+        "Key": {"rich_text": {}},
+    }
+
+
+def decision_properties_schema(projects_data_source_id: str) -> dict[str, Any]:
+    return {
+        "Рішення": {"title": {}},
+        "Дата": {"date": {}},
+        "Чат": {"select": {}},
+        "Проєкт": {
+            "relation": {
+                "data_source_id": projects_data_source_id,
+                "type": "dual_property",
+                "dual_property": {"synced_property_name": "Рішення"},
+            }
+        },
+        "Key": {"rich_text": {}},
+    }
+
+
+def project_relation_spec(projects_data_source_id: str) -> dict[str, Any]:
+    """«Проєкт» column added to the tasks database (two-way: the project gets «Задачі»)."""
+    return {
+        "relation": {
+            "data_source_id": projects_data_source_id,
+            "type": "dual_property",
+            "dual_property": {"synced_property_name": "Задачі"},
+        }
+    }
+
+
+def decision_key(chat_id: int, local_date: str, text: str) -> str:
+    digest = hashlib.sha1(_norm(text).encode()).hexdigest()[:12]
+    return f"{chat_id}:{local_date}:{digest}"
+
+
+def build_decision_properties(row: Any, text: str, key: str, project_ids: list[str]) -> dict[str, Any]:
+    return {
+        "Рішення": {"title": [_rt(text)]},
+        "Дата": {"date": {"start": row["local_date"]}},
+        "Чат": {"select": {"name": _select_name(row["title"] or str(row["chat_id"]))}},
+        "Проєкт": {"relation": [{"id": pid} for pid in project_ids]},
+        "Key": {"rich_text": [_rt(key)]},
+    }
+
+
+def build_new_project_properties(chat_name: str, key: str) -> dict[str, Any]:
+    return {
+        "Проєкт": {"title": [_rt(chat_name)]},
+        "Чати": {"multi_select": [{"name": _select_name(chat_name)}]},
+        "Статус": {"select": {"name": PROJECT_ACTIVE}},
+        "Key": {"rich_text": [_rt(key)]},
+    }
+
+
+def build_project_counters(updated_on: str | None, open_tasks: int | None, decisions: int) -> dict[str, Any]:
+    props: dict[str, Any] = {"Рішень": {"number": decisions}}
+    if updated_on:
+        props["Бриф оновлено"] = {"date": {"start": updated_on}}
+    if open_tasks is not None:
+        props["Відкритих задач"] = {"number": open_tasks}
+    return props
+
+
+BRIEF_TITLE = "🧭 Бриф проєкту"
+
+
+def build_brief_header(updated_on: str, model: str) -> list[dict[str, Any]]:
+    return [_rt(f"{BRIEF_TITLE} · оновлено {human_date(updated_on)}", bold=True), _rt(f" · {model}", color="gray")]
+
+
+def build_brief_children(brief: dict[str, Any]) -> list[dict[str, Any]]:
+    """Children of the brief callout. The callout is the only part of a project page the connector rewrites."""
+    blocks: list[dict[str, Any]] = []
+    if brief.get("summary"):
+        blocks.append(_block("paragraph", [_rt(brief["summary"], italic=True)]))
+    if brief.get("status"):
+        blocks += [_heading("📍 Поточний стан"), _block("paragraph", brief["status"])]
+    owners = [f"{o['person']} — {o['area']}" for o in brief.get("owners", []) if o.get("person")]
+    sections = [
+        ("👥 Хто за що відповідає", owners),
+        ("⚠️ Ризики й блокери", brief.get("risks", [])),
+        ("➡️ Наступні кроки", brief.get("next_steps", [])),
+        ("❓ Відкриті питання", brief.get("open_questions", [])),
+    ]
+    for title, items in sections:
+        if items:
+            blocks += [_heading(title), *_bullets(items)]
+    return blocks or [_block("paragraph", [_rt("Поки що немає даних для брифу.", color="gray")])]
+
+
+def project_view_specs(project_page_id: str, release_date: str | None, t: dict[str, str],
+                       d: dict[str, str]) -> list[dict[str, Any]]:
+    """Linked views embedded on a project page (key → spec without data_source_id/placement).
+    `t` / `d`: current column names of the tasks / decisions databases (the user may have renamed them)."""
+    in_project = {"property": t["Проєкт"], "relation": {"contains": project_page_id}}
+    checklist_date = (
+        {"property": t["Дедлайн"], "date": {"on_or_before": release_date}}
+        if release_date else {"property": t["Дедлайн"], "date": {"is_not_empty": True}}
+    )
+    return [
+        {"key": "decisions", "db": "decisions", "name": "🎯 Рішення проєкту", "type": "table",
+         "filter": {"property": d["Проєкт"], "relation": {"contains": project_page_id}},
+         "sorts": [{"property": d["Дата"], "direction": "descending"}]},
+        {"key": "tasks", "db": "tasks", "name": "✅ Задачі проєкту", "type": "table",
+         "filter": {"and": [in_project, {"property": t["Стан"], "select": {"does_not_equal": TASK_DONE}}]},
+         "sorts": [{"property": t["Дедлайн"], "direction": "ascending"}]},
+        {"key": "checklist", "db": "tasks", "name": "🚀 Чек-лист до релізу", "type": "table",
+         "filter": {"and": [in_project, checklist_date]},
+         "sorts": [{"property": t["Дедлайн"], "direction": "ascending"}]},
+    ]

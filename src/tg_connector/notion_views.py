@@ -163,3 +163,41 @@ async def ensure_views(client: Any, database_id: str, data_source_id: str, specs
             })
         done.append(spec["name"])
     return done
+
+
+def project_views(ids: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "📁 Проєкти",
+            "type": "table",
+            "default": True,
+            "sorts": [{"property": "Дата релізу", "direction": "ascending"}],
+            "quick_filters": {"Статус": {}},
+            "configuration": {
+                "type": "table",
+                "wrap_cells": True,
+                "properties": _cols(
+                    ids,
+                    ["Проєкт", "Статус", "Дата релізу", "Відкритих задач", "Рішень", "Бриф оновлено", "Чати"],
+                    ["Key", "Задачі", "Рішення"],
+                ),
+            },
+        },
+    ]
+
+
+def decision_views(ids: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "🎯 Журнал рішень",
+            "type": "table",
+            "default": True,
+            "sorts": [{"property": "Дата", "direction": "descending"}],
+            "quick_filters": {"Проєкт": {}, "Чат": {}},
+            "configuration": {
+                "type": "table",
+                "wrap_cells": True,
+                "properties": _cols(ids, ["Рішення", "Дата", "Проєкт", "Чат"], ["Key"]),
+            },
+        },
+    ]

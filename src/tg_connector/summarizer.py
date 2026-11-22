@@ -138,14 +138,26 @@ def _language_rule(setting: str, detected: str | None = None) -> str:
     )
 
 
-def _wrong_language(summary: DaySummary, lang: str | None) -> str | None:
+def _all_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _all_strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _all_strings(v)]
+    return []
+
+
+def _wrong_language(answer: BaseModel, lang: str | None) -> str | None:
     """Cheap script check of the model's answer; returns a reason to re-ask, or None."""
     if lang not in ("uk", "en"):
         return None
-    parts = [summary.tldr, *summary.facts, *summary.topics, *summary.decisions, *summary.open_questions]
-    for a in summary.action_items:
-        parts += [a.task, a.due or ""]
-    text = " ".join(parts).lower()
+    data = answer.model_dump()
+    for item in data.get("action_items", []):
+        item.pop("owner", None)  # people's names stay as they appear in the chat
+    for item in data.get("owners", []):
+        item.pop("person", None)
+    text = " ".join(_all_strings(data)).lower()
     if lang == "uk":
         found = sorted(_RU_LETTERS & set(text))
         return f"it contains Russian letters {found}" if found else None
@@ -229,8 +241,8 @@ def _clean(summary: DaySummary) -> dict[str, Any]:
 
 
 async def _call_validated(
-    llm: LLMClient, system: str, user: str, language: str | None = None
-) -> tuple[DaySummary, int]:
+    llm: LLMClient, system: str, user: str, language: str | None = None, schema: type[BaseModel] = DaySummary
+) -> tuple[Any, int]:
     """One logical LLM call: schema-validated, with bounded retries. Returns (result, api_calls)."""
     calls = 0
     prompt = user
@@ -239,7 +251,7 @@ async def _call_validated(
     while True:
         calls += 1
         try:
-            raw = await llm.generate_json(system, prompt, DaySummary)
+            raw = await llm.generate_json(system, prompt, schema)
         except LLMError as exc:
             exc.calls = calls
             # One short in-run retry for rate limits / 5xx; longer waits are left to the next run.
@@ -251,7 +263,7 @@ async def _call_validated(
                 continue
             raise
         try:
-            result = DaySummary.model_validate_json(raw)
+            result = schema.model_validate_json(raw)
         except ValidationError as exc:
             if calls > VALIDATION_RETRIES:
                 error = LLMError(f"model output does not match the schema: {exc.errors()[:3]}", retryable=False)

@@ -19,7 +19,8 @@ from typing import Any
 from .config import Settings
 from .db import Database
 from .llm import LLMClient, build_llm
-from .notion_sink import NotionSink, RENDER_SUFFIX
+from .notion_sink import PROJECTS_SUFFIX, NotionSink, RENDER_SUFFIX
+from .project_brief import update_briefs
 from .summarizer import llm_paused_until, summarize_pending
 from .sync import MessageSource, sync_tracked_chats
 
@@ -86,6 +87,9 @@ class Pipeline:
                 else:
                     report["notion"] = await self.sink.export_pending()
 
+            if summarize and export and self.settings.projects_enabled and self.sink is not None and self.llm is not None:
+                report["projects"] = await update_briefs(self.db, self.llm, self.sink, self.settings, now, heartbeat)
+
             if self.settings.raw_retention_days > 0:
                 cutoff = (now.astimezone(self.settings.timezone).date() - timedelta(days=self.settings.raw_retention_days))
                 report["retention"] = {"deleted_messages": self.db.purge_old_messages(cutoff.isoformat())}
@@ -129,7 +133,9 @@ def build_app(settings: Settings) -> App:
     llm = build_llm(settings.gemini_api_key, settings.gemini_model, settings.gemini_thinking_level)
     sink = None
     if settings.notion_token and settings.notion_parent_page_id:
-        sink = NotionSink(settings.notion_token, settings.notion_parent_page_id, db)
+        sink = NotionSink(settings.notion_token, settings.notion_parent_page_id, db,
+                          projects=settings.projects_enabled, projects_mode=settings.projects_mode,
+                          project_name=settings.project_name)
     pipeline = Pipeline(settings, db, source, llm, sink)
     return App(settings, db, source, llm, sink, pipeline)
 
@@ -186,7 +192,7 @@ def status_report(app: App) -> dict[str, Any]:
         "tracked_chats": chats,
         "pending_days": len(db.pending_days(settings.max_llm_attempts)),
         "failed_days": [dict(r) for r in db.failed_days(settings.max_llm_attempts)],
-        "summaries_waiting_for_notion": len(db.summaries_to_export(RENDER_SUFFIX)),
+        "summaries_waiting_for_notion": len(db.summaries_to_export(RENDER_SUFFIX, RENDER_SUFFIX + PROJECTS_SUFFIX)),
         "llm_paused_until": (lambda t: t.isoformat(timespec="seconds") if t else None)(llm_paused_until(db, utcnow())),
         "run_in_progress": holder is not None,
         "recent_runs": runs,

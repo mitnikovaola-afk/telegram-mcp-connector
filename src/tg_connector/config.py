@@ -86,6 +86,12 @@ class Settings:
     tg_session: str | None = None
     wait_for_state: bool = False
     raw_retention_days: int = 0
+    # Project knowledge base (beyond the task): daily project brief after this local hour.
+    projects_enabled: bool = True
+    project_brief_hour: int = 7
+    # per_chat: every tracked group chat becomes its own project; single: all of them go into one project.
+    projects_mode: str = "per_chat"
+    project_name: str = "Мій проєкт"
 
     @property
     def db_path(self) -> Path:
@@ -150,4 +156,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
         tg_session=_env("TG_SESSION"),
         wait_for_state=_env_bool("WAIT_FOR_STATE", False),
         raw_retention_days=_env_int("RAW_RETENTION_DAYS", 0),
+        projects_enabled=_env_bool("PROJECTS_ENABLED", True),
+        project_brief_hour=_env_int("PROJECT_BRIEF_HOUR", 7),
+        projects_mode=(_env("PROJECTS_MODE", "per_chat") or "per_chat").lower(),
+        project_name=_env("PROJECT_NAME", "Мій проєкт") or "Мій проєкт",
     )
