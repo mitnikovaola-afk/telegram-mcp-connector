@@ -156,6 +156,8 @@ class FakeNotion:
         self.parent_of: dict[str, str] = {}
         self.views: dict[str, dict] = {}
         self.database_titles: dict[str, str] = {}
+        self.database_parents: dict[str, str] = {}
+        self.child_pages: dict[str, dict] = {}  # ordinary pages: id -> {"parent", "title", "children"}
         self.fail_queries: Exception | None = None
         self.created = 0  # day pages only
         self.updated = 0
@@ -199,6 +201,7 @@ class FakeNotion:
             props = {name: column(f"p{n}-{i}", spec)
                      for i, (name, spec) in enumerate(initial_data_source["properties"].items())}
             self.database_titles[db_id] = title[0]["text"]["content"]
+            self.database_parents[db_id] = parent.get("page_id")
             self.data_sources[ds_id] = {"properties": props}
             self.databases_created.append({"id": db_id, "title": title[0]["text"]["content"], "ds": ds_id})
             self.views[f"view-{db_id}-default"] = {"id": f"view-{db_id}-default", "name": "Default view", "database_id": db_id}
@@ -206,12 +209,15 @@ class FakeNotion:
             return {"id": db_id, "url": f"https://notion.so/{db_id}", "data_sources": [{"id": ds_id}]}
 
         async def db_update(database_id, **kw):
+            if "parent" in kw:
+                self.database_parents[database_id] = kw["parent"]["page_id"]
             if "title" in kw:
                 self.database_titles[database_id] = kw["title"][0]["text"]["content"]
             return {"id": database_id}
 
         async def db_retrieve(database_id):
-            return {"id": database_id, "title": [{"plain_text": self.database_titles.get(database_id, "")}]}
+            return {"id": database_id, "title": [{"plain_text": self.database_titles.get(database_id, "")}],
+                    "parent": {"type": "page_id", "page_id": self.database_parents.get(database_id)}}
 
         async def ds_retrieve(data_source_id):
             return {"id": data_source_id, "properties": dict(self.data_sources[data_source_id]["properties"])}
@@ -247,6 +253,8 @@ class FakeNotion:
             if "rich_text" in flt:
                 value = "".join(t["text"]["content"] for t in prop.get("rich_text", []))
                 return bool(value) if "is_not_empty" in flt["rich_text"] else value == flt["rich_text"]["equals"]
+            if "checkbox" in flt:
+                return bool(prop.get("checkbox")) == flt["checkbox"]["equals"]
             if "relation" in flt:
                 return flt["relation"]["contains"] in [r["id"] for r in prop.get("relation", [])]
             name = (prop.get("select") or {}).get("name")
@@ -267,6 +275,10 @@ class FakeNotion:
 
         async def page_create(parent, properties, children=(), icon=None):
             pid = new_id("page-")
+            if "page_id" in parent:
+                title = properties["title"]["title"][0]["text"]["content"]
+                self.child_pages[pid] = {"parent": parent["page_id"], "title": title, "children": list(children)}
+                return {"id": pid}
             key = "".join(t["text"]["content"] for t in properties.get("Key", {}).get("rich_text", []))
             ds = parent["data_source_id"]
             self.store[pid] = {"ds": ds, "key": key, "props": dict(properties), "children": [], "icon": icon,
@@ -301,6 +313,9 @@ class FakeNotion:
             return {"id": page_id, "properties": page["props"], "in_trash": page["in_trash"], "url": f"https://notion.so/{page_id}"}
 
         async def children_list(block_id, start_cursor=None):
+            if block_id not in self.store and block_id not in self.blocks_by_id:
+                return {"results": [{"id": pid, "type": "child_page", "child_page": {"title": p["title"]}}
+                                    for pid, p in self.child_pages.items() if p["parent"] == block_id], "has_more": False}
             return {"results": [{"id": b["id"], "type": b["type"]} for b in children_of(block_id)], "has_more": False}
 
         async def block_delete(block_id):
@@ -343,6 +358,8 @@ class FakeNotion:
             if method == "PATCH" and path.startswith("views/"):
                 self.views[path.split("/", 1)[1]].update(body)
                 return self.views[path.split("/", 1)[1]]
+            if method == "DELETE" and path.startswith("views/"):
+                return self.views.pop(path.split("/", 1)[1])
             if method == "POST" and path == "views":
                 vid = new_id("view-")
                 self.views[vid] = {"id": vid, **body}

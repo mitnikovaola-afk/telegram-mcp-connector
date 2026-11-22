@@ -24,20 +24,18 @@ from notion_client.errors import APIResponseError
 from .db import Database
 from .notion_layout import (
     LOG_AI_COLUMNS,
-    LOG_DECISION,
     LOG_EFFECTS,
     LOG_TITLE,
     LOG_TYPES,
-    OLD_LOG_TITLE,
     PROJECTS_TITLE,
+    SERVICE_TITLE,
     build_brief_children,
     build_brief_header,
-    build_decision_properties,
     build_log_properties,
     build_new_project_properties,
+    build_service_page,
     build_team_section,
     checklist_view_spec,
-    decision_key,
     log_properties_schema,
     plain_value,
     project_properties_schema,
@@ -80,14 +78,15 @@ KV_DAY_PROP_IDS = "notion_day_property_ids"
 KV_TASK_PROP_IDS = "notion_task_property_ids"
 KV_PROJECTS_DATABASE = "notion_projects_database_id"
 KV_PROJECTS_DATA_SOURCE = "notion_projects_data_source_id"
-KV_DECISIONS_DATABASE = "notion_decisions_database_id"
-KV_DECISIONS_DATA_SOURCE = "notion_decisions_data_source_id"
+KV_LOG_DATABASE = "notion_decisions_database_id"
+KV_LOG_DATA_SOURCE = "notion_decisions_data_source_id"
 KV_PROJECT_PROP_IDS = "notion_project_property_ids"
-KV_DECISION_PROP_IDS = "notion_decision_property_ids"
+KV_LOG_PROP_IDS = "notion_decision_property_ids"
 KV_PROJECTS_LAYOUT = "notion_projects_layout_version"
 KV_DEFAULT_PROJECT = "project_default_page"
-# v2: project page = passport + log; decisions database → project log; one-way «Проєкт» links, no counters.
-PROJECTS_LAYOUT_VERSION = "2"
+# v3: the log keeps important entries only and lives on the service page.
+PROJECTS_LAYOUT_VERSION = "3"
+KV_SERVICE_PAGE = "notion_service_page"
 KV_TASK_PROJECT_READY = "notion_task_project_column_ready"  # the «Проєкт» column exists on tasks
 MIN_INTERVAL_S = 0.35  # Notion allows ~3 requests/s per integration
 
@@ -97,11 +96,11 @@ LAYOUT_VERSION = "1"
 # v2: pages of days with voice notes lost their content; v3: new layout + tasks database;
 # v4: deadline shown as "📅 вівторок, 24.11", weekday-only deadlines get a date;
 # v5: page title = topics of the day (chat and date are already columns);
-# v6: decision log rows and the «Проєкт» relation of tasks for days exported before projects existed.
+# v6: the «Проєкт» relation of tasks for days exported before projects existed.
 RENDER_VERSION = "6"
 RENDER_SUFFIX = f":r{RENDER_VERSION}"
-# Added once a day is exported together with its decision-log rows. If the project databases were not
-# available at that moment, the day is exported once more when they are (no decision is lost).
+# Added once the tasks of a day are linked to their project. If the project databases were not available at
+# that moment, the day is exported once more when they are.
 PROJECTS_SUFFIX = "p"
 
 # Kept for callers/tests that import them from here.
@@ -139,10 +138,11 @@ class NotionSink:
         self._last_call = loop.time()
 
     # ------------------------------------------------------------------ setup
-    async def _create_database(self, title: str, emoji: str, properties: dict[str, Any]) -> tuple[str, str]:
+    async def _create_database(self, title: str, emoji: str, properties: dict[str, Any],
+                               parent_page_id: str | None = None) -> tuple[str, str]:
         await self._throttle()
         database = await self.client.databases.create(
-            parent={"type": "page_id", "page_id": self.parent_page_id},
+            parent={"type": "page_id", "page_id": parent_page_id or self.parent_page_id},
             title=_title(title),
             icon={"type": "emoji", "emoji": emoji},
             initial_data_source={"properties": properties},
@@ -209,7 +209,7 @@ class NotionSink:
 
     # ------------------------------------------------------------- projects (beyond the task)
     async def ensure_projects_layout(self) -> tuple[str, str] | None:
-        """Projects + decision-log databases, the «Проєкт» relation on tasks, and their views (once)."""
+        """Projects + project-log databases, the «Проєкт» relation on tasks, and their views (once)."""
         if not self.projects_enabled:
             return None
         days_ds = await self.ensure_data_source()
@@ -219,113 +219,112 @@ class NotionSink:
             database_id, projects_ds = await self._create_database(PROJECTS_TITLE, "📁", project_properties_schema())
             self.db.kv_set(KV_PROJECTS_DATABASE, database_id)
             self.db.kv_set(KV_PROJECTS_DATA_SOURCE, projects_ds)
-        decisions_ds = self.db.kv_get(KV_DECISIONS_DATA_SOURCE)
-        if not decisions_ds:
-            database_id, decisions_ds = await self._create_database(LOG_TITLE, "📒", log_properties_schema(projects_ds))
-            self.db.kv_set(KV_DECISIONS_DATABASE, database_id)
-            self.db.kv_set(KV_DECISIONS_DATA_SOURCE, decisions_ds)
+        log_ds = self.db.kv_get(KV_LOG_DATA_SOURCE)
+        if not log_ds:
+            database_id, log_ds = await self._create_database(LOG_TITLE, "📒", log_properties_schema(projects_ds),
+                                                              await self._service_page())
+            self.db.kv_set(KV_LOG_DATABASE, database_id)
+            self.db.kv_set(KV_LOG_DATA_SOURCE, log_ds)
         if self.db.kv_get(KV_PROJECTS_LAYOUT) == PROJECTS_LAYOUT_VERSION:
-            return projects_ds, decisions_ds
-        await self._migrate_projects(projects_ds, decisions_ds, tasks_ds)
+            return projects_ds, log_ds
+        await self._migrate_to_v3(log_ds)
         with_project = task_properties_schema(days_ds) | {"Проєкт": project_relation_spec(projects_ds)}
         await self.property_names(tasks_ds, KV_TASK_PROP_IDS, with_project)  # adds «Проєкт» to tasks
         self.db.kv_set(KV_TASK_PROJECT_READY, "1")
         await self.property_names(projects_ds, KV_PROJECT_PROP_IDS, project_properties_schema())
-        log_names = await self.property_names(decisions_ds, KV_DECISION_PROP_IDS, log_properties_schema(projects_ds))
-        await self._fill_decision_types(decisions_ds, log_names)
+        await self.property_names(log_ds, KV_LOG_PROP_IDS, log_properties_schema(projects_ds))
         try:
             await ensure_views(self.views_client, self.db.kv_get(KV_PROJECTS_DATABASE), projects_ds,
                                project_views(self._view_ids(KV_PROJECT_PROP_IDS)), self._throttle)
-            await ensure_views(self.views_client, self.db.kv_get(KV_DECISIONS_DATABASE), decisions_ds,
-                               log_views(self._view_ids(KV_DECISION_PROP_IDS)), self._throttle)
+            await ensure_views(self.views_client, self.db.kv_get(KV_LOG_DATABASE), log_ds,
+                               log_views(self._view_ids(KV_LOG_PROP_IDS)), self._throttle)
         except APIResponseError as exc:
             log.warning("Could not set up project views (%s); will retry next run", exc)
-            return projects_ds, decisions_ds
+            return projects_ds, log_ds
         self.db.kv_set(KV_PROJECTS_LAYOUT, PROJECTS_LAYOUT_VERSION)
-        return projects_ds, decisions_ds
+        return projects_ds, log_ds
 
     def _view_ids(self, kv_key: str) -> dict[str, str]:
         """Our column name → property id for view filters and columns (a renamed column keeps its id)."""
         return {name: unquote(pid) for name, pid in json.loads(self.db.kv_get(kv_key) or "{}").items()}
 
-    async def _migrate_projects(self, projects_ds: str, log_ds: str, tasks_ds: str) -> None:
-        """Databases of the first version (22.11) → passport + log. Every step is safe to repeat; rows, links and
-        the user's own columns and names stay."""
-        await self._rename_column(log_ds, KV_DECISION_PROP_IDS, "Рішення", "Запис")
-        await self._rename_column(projects_ds, KV_PROJECT_PROP_IDS, "Бриф оновлено", "Оновлено")
-        await self._make_one_way(tasks_ds, KV_TASK_PROP_IDS, projects_ds)
-        await self._make_one_way(log_ds, KV_DECISION_PROP_IDS, projects_ds)
-        await self._drop_columns(projects_ds, KV_PROJECT_PROP_IDS, ("Відкритих задач", "Рішень", "Key"))
-        await self._throttle()
-        database = await self.client.databases.retrieve(self.db.kv_get(KV_DECISIONS_DATABASE))
-        if "".join(t.get("plain_text", "") for t in database.get("title", [])) == OLD_LOG_TITLE:
+    async def _service_page(self) -> str:
+        """Page that holds the log: people see it through the project pages, so it does not clutter the main page."""
+        stored = self.db.kv_get(KV_SERVICE_PAGE)
+        if stored:
+            return stored
+        cursor, page_id = None, None
+        while page_id is None:  # created by a run that died before remembering it?
             await self._throttle()
-            await self.client.databases.update(database["id"], title=_title(LOG_TITLE), icon={"type": "emoji", "emoji": "📒"})
-            await self._throttle()
-            await self.client.data_sources.update(log_ds, title=_title(LOG_TITLE))
-            await self._rename_view(database["id"], "🎯 Журнал рішень", "🗂 Усі записи")
-
-    async def _fill_decision_types(self, log_ds: str, n: dict[str, str]) -> None:
-        """Decision rows made before the «Тип» column existed (rows of the user, without our Key, are not touched)."""
-        while True:
-            await self._throttle()
-            result = await self.client.data_sources.query(log_ds, page_size=100, filter={"and": [
-                {"property": n["Тип"], "select": {"is_empty": True}},
-                {"property": n["Key"], "rich_text": {"is_not_empty": True}},
-            ]})
-            for page in result.get("results", []):
-                await self._update_row(page["id"], {n["Тип"]: {"select": {"name": LOG_DECISION}}})
+            result = await self.client.blocks.children.list(self.parent_page_id, **({"start_cursor": cursor} if cursor else {}))
+            page_id = next((b["id"] for b in result.get("results", [])
+                            if (b.get("child_page") or {}).get("title") == SERVICE_TITLE), None)
             if not result.get("has_more"):
-                return
-
-    async def _rename_view(self, database_id: str, old: str, new: str) -> None:
-        await self._throttle()
-        listing = await self.views_client.request(path=f"views?database_id={database_id}", method="GET")
-        for ref in listing.get("results", []):
+                break
+            cursor = result.get("next_cursor")
+        if page_id is None:
             await self._throttle()
-            view = await self.views_client.request(path=f"views/{ref['id']}", method="GET")
-            if view.get("name") == old:
+            page = await self.client.pages.create(
+                parent={"type": "page_id", "page_id": self.parent_page_id}, icon={"type": "emoji", "emoji": "⚙️"},
+                properties={"title": {"title": _title(SERVICE_TITLE)}}, children=build_service_page())
+            page_id = page["id"]
+        self.db.kv_set(KV_SERVICE_PAGE, page_id)
+        return page_id
+
+    # --- one-off: the log of the previous version (all decisions + «Важливе» checkbox, database on the main page)
+    async def _migrate_to_v3(self, log_ds: str) -> None:
+        database_id = self.db.kv_get(KV_LOG_DATABASE)
+        ids = json.loads(self.db.kv_get(KV_LOG_PROP_IDS) or "{}")
+        if "Важливе" in ids:
+            await self._throttle()
+            props = (await self.client.data_sources.retrieve(log_ds))["properties"]
+            by_id = {p["id"]: name for name, p in props.items()}
+            important, kind, key = by_id.get(ids["Важливе"]), by_id.get(ids["Тип"]), by_id.get(ids["Key"])
+            while important and kind and key:  # routine decisions leave the log (they stay on the day pages)
                 await self._throttle()
-                await self.views_client.request(path=f"views/{view['id']}", method="PATCH", body={"name": new})
-
-    async def _rename_column(self, data_source_id: str, kv_key: str, old: str, new: str) -> None:
-        ids = json.loads(self.db.kv_get(kv_key) or "{}")
-        if old not in ids:
-            return
-        await self._throttle()
-        props = (await self.client.data_sources.retrieve(data_source_id))["properties"]
-        if old in props and props[old]["id"] == ids[old] and new not in props:  # not renamed by the user
+                result = await self.client.data_sources.query(log_ds, page_size=100, filter={"and": [
+                    {"property": important, "checkbox": {"equals": False}},
+                    {"property": kind, "select": {"equals": LOG_TYPES["decision"]}},
+                    {"property": key, "rich_text": {"is_not_empty": True}},
+                ]})
+                for page in result.get("results", []):
+                    await self._throttle()
+                    await self.client.pages.update(page["id"], in_trash=True)
+                if not result.get("has_more"):
+                    break
+            view_ids = {name: unquote(pid) for name, pid in ids.items() if name != "Важливе"}
             await self._throttle()
-            await self.client.data_sources.update(data_source_id, properties={old: {"name": new}})
-        ids[new] = ids.pop(old)
-        self.db.kv_set(kv_key, json.dumps(ids, ensure_ascii=False))
-
-    async def _make_one_way(self, data_source_id: str, kv_key: str, projects_ds: str) -> None:
-        """Two-way «Проєкт» → one-way: the list of rows disappears from the project page, the links of the rows
-        stay. (Deleting the mirror column instead would delete the relation on both sides.)"""
-        await self._throttle()
-        props = (await self.client.data_sources.retrieve(data_source_id))["properties"]
-        pid = json.loads(self.db.kv_get(kv_key) or "{}").get("Проєкт")
-        for name, prop in props.items():
-            if prop["id"] == pid and (prop.get("relation") or {}).get("type") == "dual_property":
+            listing = await self.views_client.request(path=f"views?database_id={database_id}", method="GET")
+            specs = {s["name"]: s for s in log_views(view_ids)}
+            for ref in listing.get("results", []):
                 await self._throttle()
-                await self.client.data_sources.update(data_source_id, properties={name: project_relation_spec(projects_ds)})
-
-    async def _drop_columns(self, data_source_id: str, kv_key: str, ours: tuple[str, ...]) -> None:
-        """Remove columns the connector itself created and computed (never the user's)."""
-        ids = json.loads(self.db.kv_get(kv_key) or "{}")
-        pids = {ids[name]: name for name in ours if name in ids}
-        if not pids:
-            return
+                view = await self.views_client.request(path=f"views/{ref['id']}", method="GET")
+                await self._throttle()
+                if view.get("name") in specs:
+                    body = {"filter": None} | view_body(specs[view["name"]])
+                    body.pop("type")
+                    await self.views_client.request(path=f"views/{view['id']}", method="PATCH", body=body)
+                elif view.get("name") == "🗂 Усі записи":
+                    await self.views_client.request(path=f"views/{view['id']}", method="DELETE")
+            for row in self.db.conn.execute("SELECT key, value FROM kv WHERE key LIKE 'project_views:%'").fetchall():
+                page_id, stored = row["key"].partition(":")[2], json.loads(row["value"])
+                for spec in log_views(view_ids, page_id):
+                    if spec["key"] in stored:
+                        body = view_body(spec)
+                        body.pop("type")
+                        await self._throttle()
+                        await self.views_client.request(path=f"views/{stored[spec['key']]['id']}", method="PATCH", body=body)
+            if important:
+                await self._throttle()
+                await self.client.data_sources.update(log_ds, properties={important: None})
+            ids.pop("Важливе")
+            self.db.kv_set(KV_LOG_PROP_IDS, json.dumps(ids, ensure_ascii=False))
         await self._throttle()
-        props = (await self.client.data_sources.retrieve(data_source_id))["properties"]
-        gone = {name: None for name, prop in props.items() if prop["id"] in pids}
-        if gone:
+        parent = (await self.client.databases.retrieve(database_id)).get("parent") or {}
+        service = await self._service_page()
+        if (parent.get("page_id") or "").replace("-", "") == self.parent_page_id.replace("-", ""):
             await self._throttle()
-            await self.client.data_sources.update(data_source_id, properties=gone)
-        for name in pids.values():
-            ids.pop(name)
-        self.db.kv_set(kv_key, json.dumps(ids, ensure_ascii=False))
+            await self.client.databases.update(database_id, parent={"type": "page_id", "page_id": service})
 
     async def load_projects(self) -> list[dict[str, Any]]:
         """Projects as the user sees them in Notion (their «Чати» column is the chat → project mapping)."""
@@ -405,7 +404,7 @@ class NotionSink:
 
     def requeue_moved_chats(self, by_chat: dict[str, list[str]]) -> None:
         """The user changed a «Чати» column: days of that chat are exported again, so that the «Проєкт» links
-        of its old tasks and decisions follow (no LLM calls)."""
+        of its old tasks follow (no LLM calls)."""
         for chat in self.db.all_chats():
             name = chat["title"] or str(chat["chat_id"])
             links, key = ",".join(sorted(by_chat.get(select_name(name), []))), f"project_links:{chat['chat_id']}"
@@ -415,40 +414,6 @@ class NotionSink:
             if before is not None and (days := self.db.requeue_export(chat["chat_id"])):
                 log.info("Project of chat «%s» changed: %d day(s) will be linked again", name, days)
             self.db.kv_set(key, links)
-
-    async def _sync_decisions(self, row: Any, decisions_ds: str, names: dict[str, str], project_ids: list[str],
-                              stats: dict[str, Any]) -> None:
-        """Decision log rows for one chat-day. The log belongs to the connector: rows of decisions that are
-        no longer in the summary are removed; no duplicates on re-runs (key = chat + date + text hash).
-        A private chat stays out of the log until the user puts it into a project."""
-        chat_id, local_date = row["chat_id"], row["local_date"]
-        summary = json.loads(row["summary_json"])
-        belongs = bool(project_ids) or row["kind"] in ("group", "channel")
-        texts = summary.get("decisions", []) if row["status"] == "ok" and belongs else []
-        known = self.db.notion_decisions_for_day(chat_id, local_date)
-        seen: set[str] = set()
-        for text in texts:
-            key = decision_key(chat_id, local_date, text)
-            if key in seen:
-                continue
-            seen.add(key)
-            page_id = known.get(key) or await self._find_page(decisions_ds, key, names["Key"])
-            props = _renamed(build_decision_properties(row, text, key, project_ids, new=not page_id), names)
-            if page_id:
-                await self._update_row(page_id, props)
-            else:
-                await self._throttle()
-                page = await self.client.pages.create(
-                    parent={"type": "data_source_id", "data_source_id": decisions_ds}, properties=props)
-                page_id = page["id"]
-                stats["decisions_created"] += 1
-            self.db.save_notion_decision(chat_id, local_date, key, page_id)
-        for key, page_id in known.items():
-            if key not in seen:
-                await self._throttle()
-                await self.client.pages.update(page_id, in_trash=True)
-                self.db.forget_notion_decision(chat_id, local_date, key)
-                stats["decisions_removed"] += 1
 
     async def _update_row(self, page_id: str, properties: dict[str, Any]) -> bool:
         """Update a row; False if the user moved it to the trash (their decision: it is not brought back)."""
@@ -464,12 +429,12 @@ class NotionSink:
 
     # ------------------------------------------------------------- project log (beyond the task)
     async def _log_names(self) -> dict[str, str]:
-        return await self.property_names(self.db.kv_get(KV_DECISIONS_DATA_SOURCE), KV_DECISION_PROP_IDS,
+        return await self.property_names(self.db.kv_get(KV_LOG_DATA_SOURCE), KV_LOG_PROP_IDS,
                                          log_properties_schema(self.db.kv_get(KV_PROJECTS_DATA_SOURCE)))
 
     async def load_log(self, project_page_id: str) -> list[dict[str, Any]]:
-        """Important log rows of a project as the user sees them now (with their edits and their own rows)."""
-        n, ds = await self._log_names(), self.db.kv_get(KV_DECISIONS_DATA_SOURCE)
+        """Log rows of a project as the user sees them now (with their edits and their own rows)."""
+        n, ds = await self._log_names(), self.db.kv_get(KV_LOG_DATA_SOURCE)
         types = {label: key for key, label in LOG_TYPES.items()}
         effects = {label: key for key, label in LOG_EFFECTS.items()}
         rows: list[dict[str, Any]] = []
@@ -483,10 +448,10 @@ class NotionSink:
             for page in result.get("results", []):
                 if page.get("in_trash"):
                     continue
-                v = {ours: plain_value(page.get("properties", {}).get(n[ours])) for ours in (*LOG_AI_COLUMNS, "Важливе")}
+                v = {ours: plain_value(page.get("properties", {}).get(n[ours])) for ours in LOG_AI_COLUMNS}
                 rows.append({
                     "page_id": page["id"], "date": v["Дата"], "title": v["Запис"],
-                    "type": types.get(v["Тип"], v["Тип"]), "important": bool(v["Важливе"]),
+                    "type": types.get(v["Тип"], v["Тип"]),
                     "result": v["Результат"] or None, "effect": effects.get(v["Ефект"], v["Ефект"]),
                     "takeaway": v["Висновок"] or None, "metric": v["Метрика"], "value": v["Значення"],
                 })
@@ -498,21 +463,21 @@ class NotionSink:
         """Write new/changed log entries to Notion. A value the user changed in Notion is never overwritten, a row
         the user removed is never created again."""
         pending = self.db.project_log(project_page_id, "dirty")
-        if not pending:
+        obsolete = self.db.project_log(project_page_id, "obsolete")
+        if not pending and not obsolete:
             return 0
-        n, ds = await self._log_names(), self.db.kv_get(KV_DECISIONS_DATA_SOURCE)
+        n, ds = await self._log_names(), self.db.kv_get(KV_LOG_DATA_SOURCE)
         done = 0
+        for row in obsolete:
+            done += await self._retire_row(row, n)
         for row in pending:
             entry = json.loads(row["entry_json"])
-            if entry["type"] == "decision":
-                done += await self._mark_decision(row, entry, n)
-                continue
             wanted = build_log_properties(entry)
             key = f"log:{project_page_id}:{row['entry_key']}"
             page_id = row["page_id"] or await self._find_page(ds, key, n["Key"])
             written = json.loads(row["written_json"] or "{}")
             if page_id is None:
-                extra = {"Важливе": {"checkbox": True}, "Проєкт": {"relation": [{"id": project_page_id}]},
+                extra = {"Проєкт": {"relation": [{"id": project_page_id}]},
                          "Key": {"rich_text": [{"type": "text", "text": {"content": key}}]}}
                 await self._throttle()
                 page = await self.client.pages.create(
@@ -523,7 +488,7 @@ class NotionSink:
                 await self._throttle()
                 page = await self.client.pages.retrieve(page_id)
                 if page.get("in_trash"):
-                    self.db.dismiss_log_row(row["id"])
+                    self.db.set_log_state(row["id"], "dismissed")
                     continue
                 current = {ours: plain_value(page["properties"].get(n[ours])) for ours in wanted}
                 changed = {ours: value for ours, value in wanted.items()
@@ -536,22 +501,19 @@ class NotionSink:
             done += 1
         return done
 
-    async def _mark_decision(self, row: Any, entry: dict[str, Any], n: dict[str, str]) -> int:
-        """Tick «Важливе» on a decision ONCE; if the user unticks it later, it stays unticked."""
-        page_id = self.db.notion_decision_page(row["entry_key"].removeprefix("decision:"))
-        if page_id is None:
-            return 0  # not exported yet (or no longer in the summary): look again next time
-        await self._throttle()
-        page = await self.client.pages.retrieve(page_id)
-        if page.get("in_trash"):
-            self.db.dismiss_log_row(row["id"])
-            return 0
-        props: dict[str, Any] = {n["Важливе"]: {"checkbox": True}}
-        if entry.get("takeaway") and not plain_value(page["properties"].get(n["Висновок"])):
-            props[n["Висновок"]] = {"rich_text": [{"type": "text", "text": {"content": entry["takeaway"]}}]}
-        await self._throttle()
-        await self.client.pages.update(page_id, properties=props)
-        self.db.log_row_synced(row["id"], page_id, None)
+    async def _retire_row(self, row: Any, n: dict[str, str]) -> int:
+        """The decision is no longer in its day summary: its row goes to the trash, unless the user worked on it."""
+        removed = False
+        if row["page_id"]:
+            await self._throttle()
+            page = await self.client.pages.retrieve(row["page_id"])
+            written = json.loads(row["written_json"]) if row["written_json"] else None
+            removed = not page.get("in_trash") and written is not None and all(
+                plain_value(page["properties"].get(n[ours])) == value for ours, value in written.items())
+            if removed:
+                await self._throttle()
+                await self.client.pages.update(row["page_id"], in_trash=True)
+        self.db.retire_log_row(row["id"], row_removed=removed)
         return 1
 
     # ------------------------------------------------------------- project page
@@ -606,16 +568,11 @@ class NotionSink:
         page_id = project["page_id"]
         kv_key = f"project_views:{page_id}"
         stored = json.loads(self.db.kv_get(kv_key) or "{}")
-        log_ds, tasks_ds = self.db.kv_get(KV_DECISIONS_DATA_SOURCE), self.db.kv_get(KV_TASKS_DATA_SOURCE)
+        log_ds, tasks_ds = self.db.kv_get(KV_LOG_DATA_SOURCE), self.db.kv_get(KV_TASKS_DATA_SOURCE)
         t = await self.property_names(tasks_ds, KV_TASK_PROP_IDS, self._task_schema(self.db.kv_get(KV_DATA_SOURCE)))
         await self._log_names()
         try:
-            for old in ("decisions", "tasks", "checklist"):  # tables of the first version of the page
-                if old in stored:
-                    await self._remove_linked_table(stored[old]["id"])
-                    del stored[old]
-                    self.db.kv_set(kv_key, json.dumps(stored))
-            for spec in log_views(self._view_ids(KV_DECISION_PROP_IDS), page_id):
+            for spec in log_views(self._view_ids(KV_LOG_PROP_IDS), page_id):
                 if spec["key"] in stored:
                     continue
                 body = {"data_source_id": log_ds, **view_body(spec)}
@@ -652,21 +609,6 @@ class NotionSink:
             view = await self.views_client.request(path="views", method="POST", body={
                 "database_id": self.db.kv_get(KV_TASKS_DATABASE), "data_source_id": tasks_ds, **view_body(spec)})
             stored["release"] = {"id": view["id"], **version}
-
-    async def _remove_linked_table(self, view_id: str) -> None:
-        """Remove a linked table the connector put on a project page (the source database is not touched)."""
-        try:
-            await self._throttle()
-            view = await self.views_client.request(path=f"views/{view_id}", method="GET")
-            container = (view.get("parent") or {}).get("database_id")
-            own = {self.db.kv_get(k) for k in (KV_DATABASE, KV_TASKS_DATABASE, KV_PROJECTS_DATABASE, KV_DECISIONS_DATABASE)}
-            if not container or container.replace("-", "") in {(o or "").replace("-", "") for o in own}:
-                return
-            await self._throttle()
-            await self.client.blocks.delete(container)
-        except APIResponseError as exc:
-            if exc.code != "object_not_found":  # the user already removed it
-                raise
 
     async def _name_table(self, view: dict[str, Any], title: str) -> None:
         """A linked table is born «Untitled»; its title is its own, the source database keeps its name."""
@@ -801,24 +743,19 @@ class NotionSink:
             await self.ensure_layout()
         projects_setup: tuple[str, str] | None = None
         by_chat: dict[str, list[str]] | None = None
-        decision_names: dict[str, str] = {}
         if self.projects_enabled:
             try:
-                projects_ds, decisions_ds = await self.ensure_projects_layout()
+                projects_setup = await self.ensure_projects_layout()
                 by_chat = self.projects_by_chat(await self.assign_chats(await self.load_projects()))
-                decision_names = await self.property_names(decisions_ds, KV_DECISION_PROP_IDS,
-                                                           log_properties_schema(projects_ds))
-                projects_setup = (projects_ds, decisions_ds)
                 self.requeue_moved_chats(by_chat)
             except APIResponseError as exc:  # projects are an extra: summaries and tasks go on without them
-                by_chat = None
+                projects_setup, by_chat = None, None
                 log.warning("Project databases are not ready (%s); will retry next run", exc)
                 stats["errors"].append({"key": "projects", "error": f"{exc.code}: {exc}"})
         with_projects = RENDER_SUFFIX + PROJECTS_SUFFIX
         rows = self.db.summaries_to_export(*((with_projects,) if projects_setup else (RENDER_SUFFIX, with_projects)))
         if not rows:
             return stats
-        stats |= {"decisions_created": 0, "decisions_removed": 0}
         days_ds = await self.ensure_data_source()
         tasks_ds = await self.ensure_tasks_data_source(days_ds)
         day_names = await self.property_names(days_ds, KV_DAY_PROP_IDS, DAY_PROPERTIES)
@@ -849,8 +786,6 @@ class NotionSink:
                 project_ids = by_chat.get(select_name(row["title"] or str(row["chat_id"])), []) if by_chat is not None else None
                 tasks = await self._sync_tasks(row, page_id, tasks_ds, stats, task_names, project_ids)
                 await self._replace_content(page_id, build_day_blocks(row, tasks))
-                if projects_setup:  # last: if it fails, the day itself is complete and is retried next run
-                    await self._sync_decisions(row, projects_setup[1], decision_names, project_ids or [], stats)
                 self.db.set_notion_page(row["chat_id"], row["local_date"], page_id, row["export_hash"] + suffix)
             except APIResponseError as exc:
                 stats["failed"] += 1

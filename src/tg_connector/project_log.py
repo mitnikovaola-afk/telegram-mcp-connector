@@ -1,9 +1,9 @@
 """Project log: the memory of a project — what was decided, tested, measured, released, what broke.
 
-Decisions come from the day summaries without an LLM; the daily update only marks the ones that matter for
-the product. Tests, analytics, releases and problems are extracted in the same daily LLM call as the passport.
-One event is one row: a later result updates the row of the test instead of adding a new one, a metric has one
-row per day, so its dynamics stay readable. Rows the user edited, added or removed are respected.
+Only what matters for the product: decisions (the model picks them by id from the day summaries, their text is
+never rewritten), tests, analytics, releases and problems. Everything comes from the same daily LLM call as the
+passport. One event is one row: a later result updates the row of the test instead of adding a new one, a metric
+has one row per day, so its dynamics stay readable. Rows the user edited, added or removed are respected.
 """
 
 from __future__ import annotations
@@ -97,12 +97,12 @@ class LogContext:
 
     own: dict[str, Any] = field(default_factory=dict)  # "L1" → project_log row
     stored: dict[str, Any] = field(default_factory=dict)  # entry key → project_log row (also rows not shown)
-    decisions: dict[str, str] = field(default_factory=dict)  # "D1" → decision key
+    decisions: dict[str, dict[str, Any]] = field(default_factory=dict)  # "D1" → its log entry + "key"
     lines: list[str] = field(default_factory=list)
     metrics: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     removed_ids: list[int] = field(default_factory=list)
-    marked: set[str] = field(default_factory=set)
+    known_decisions: set[str] = field(default_factory=set)
     foreign: set[tuple[str, str]] = field(default_factory=set)  # (date, title) of rows the connector does not own
 
     @classmethod
@@ -111,20 +111,18 @@ class LogContext:
         ctx = cls()
         by_page = {row["page_id"]: row for row in stored if row["page_id"]}
         visible = {r["page_id"] for r in in_notion}
-        ctx.marked = {row["entry_key"] for row in stored if row["entry_key"].startswith("decision:")}
+        ctx.known_decisions = {row["entry_key"] for row in stored
+                               if row["entry_key"].startswith("decision:") and row["state"] not in ("obsolete", "retired")}
         for row in stored:
-            if row["entry_key"].startswith("decision:"):
-                continue
             ctx.stored[row["entry_key"]] = row
             gone = row["page_id"] and row["page_id"] not in visible and row["created_on"] < today
             if row["state"] == "dismissed" or gone:
-                ctx.removed.append(json.loads(row["entry_json"])["title"])
+                ctx.removed.append(json.loads(row["entry_json"]).get("title") or "")
                 if row["state"] != "dismissed":
                     ctx.removed_ids.append(row["id"])
-        ctx.removed = ctx.removed[-MAX_REMOVED_SHOWN:]
+        ctx.removed = [title for title in ctx.removed if title][-MAX_REMOVED_SHOWN:]
         ctx.metrics = sorted({r["metric"] for r in in_notion if r.get("metric")})
-        shown = [r for r in in_notion if r["important"] or r["page_id"] in by_page][-MAX_CONTEXT_ROWS:]
-        for r in shown:
+        for r in in_notion[-MAX_CONTEXT_ROWS:]:
             row = by_page.get(r["page_id"])
             mine = row is not None and not row["entry_key"].startswith("decision:")
             ref = f"L{len(ctx.own) + 1}" if mine else "-"
@@ -140,24 +138,29 @@ class LogContext:
         labelled = []
         for text in day["decisions"]:
             ref = f"D{len(self.decisions) + 1}"
-            self.decisions[ref] = decision_key(chat_id, day["date"], text)
+            self.decisions[ref] = {"key": decision_key(chat_id, day["date"], text), "date": day["date"],
+                                   "title": text, "chat": day["chat"]}
             labelled.append({"id": ref, "text": text})
         return day | {"decisions": labelled}
 
     def apply(self, key_decisions: list[KeyDecision], items: list[LogItem], first_day: str, last_day: str) -> dict[str, dict[str, Any]]:
         """The model's answer → {entry_key: entry} to store. Ids it invented, repeats and empty items are dropped."""
         out: dict[str, dict[str, Any]] = {}
-        for d in key_decisions:
-            key = self.decisions.get(d.id.strip())
-            if key and f"decision:{key}" not in self.marked:
-                out[f"decision:{key}"] = {"type": "decision", "takeaway": _clip(d.takeaway, 400)}
         removed = {_norm(title) for title in self.removed}
+        for d in key_decisions:
+            found = self.decisions.get(d.id.strip())
+            if found is None or f"decision:{found['key']}" in self.known_decisions:
+                continue
+            if _norm(found["title"]) not in removed and (found["date"], _norm(found["title"])) not in self.foreign:
+                out[f"decision:{found['key']}"] = {
+                    "type": "decision", "date": found["date"], "title": found["title"][:1900], "chat": found["chat"],
+                    "result": None, "effect": None, "takeaway": _clip(d.takeaway, 400), "metric": None, "value": None}
         new = 0
         for item in items:
             entry = clean_item(item, first_day, last_day)
             if entry is None or _norm(entry["title"]) in removed:
                 continue
-            row = self.own.get((item.id or "").strip())
+            row = self.own.get((item.id or "").strip())  # decisions are not among them: their text is fixed
             if row is not None and entry["type"] == "analytics" and json.loads(row["entry_json"])["date"] != entry["date"]:
                 row = None  # a new measurement of a known metric is a new row: that is the dynamics
             row = row or self.stored.get(entry_key(entry))

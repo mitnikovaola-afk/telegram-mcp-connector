@@ -1,5 +1,5 @@
-"""Project log: what matters is marked once, events are one row each, metrics keep their dynamics,
-the user's edits and removals are respected, the first version of the databases is migrated in place."""
+"""Project log: only what matters gets in, events are one row each, metrics keep their dynamics,
+the user's edits and removals are respected."""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ from datetime import timedelta
 
 import httpx
 import pytest
-from conftest import GOOD_BRIEF, at
+from conftest import GOOD_BRIEF, GOOD_SUMMARY, at
 from notion_client.errors import APIResponseError
 
 from tg_connector.notion_layout import LOG_TYPES
-from tg_connector.notion_sink import KV_DECISION_PROP_IDS, KV_PROJECT_PROP_IDS, KV_PROJECTS_LAYOUT, KV_TASK_PROP_IDS
+from tg_connector.notion_sink import KV_LOG_PROP_IDS, KV_PROJECTS_LAYOUT, KV_SERVICE_PAGE
 from tg_connector.project_brief import ProjectBrief
 from tg_connector.project_log import LogContext
 
@@ -60,43 +60,90 @@ def rows(env, kind: str | None = None) -> list[dict]:
 # ------------------------------------------------------------------ importance
 
 
-async def test_only_decisions_the_model_calls_important_are_marked(env):
+async def test_only_decisions_the_model_calls_important_reach_the_log(env):
     # days are shown oldest first, then by chat id: D1 — «Продукт», D2 — «Маркетинг»
-    answer(env, key_decisions=[{"id": "D1", "takeaway": "Реліз зсунуто, щоб дотестувати"}, {"id": "D99", "takeaway": None}])
+    answer(env, key_decisions=[{"id": "D1", "takeaway": "Щоб дотестувати"}, {"id": "D99", "takeaway": None}])
     await env.run()
 
     prompt = env.llm.brief_prompts[0]
     assert '{"id": "D1", "text":' in prompt and '{"id": "D2", "text":' in prompt
-    decisions = {r["Чат"]: r for r in rows(env, "decision")}
-    assert set(decisions) == {"Маркетинг", "Продукт"}  # the database keeps ALL decisions
-    assert decisions["Продукт"]["Важливе"] is True and decisions["Продукт"]["Висновок"] == "Реліз зсунуто, щоб дотестувати"
-    assert "Важливе" not in decisions["Маркетинг"]  # an id the model invented (D99) is ignored
+    (row,) = rows(env, "decision")  # routine stays on the day pages; an id the model invented (D99) is ignored
+    assert (row["Чат"], row["Запис"], row["Висновок"]) == ("Продукт", GOOD_SUMMARY["decisions"][0], "Щоб дотестувати")
+    assert row["Дата"]["start"] == "2026-11-20" and [r["id"] for r in row["Проєкт"]] == list(env.notion.projects)
 
 
-async def test_unticked_by_the_user_stays_unticked(env):
+async def test_private_chats_never_reach_the_log(env):
+    env.track(42, "Олег", kind="dm")
+    env.source.add(42, 1, "Вирішили між собою", at(20, 9))
+    answer(env, key_decisions=[{"id": f"D{i}", "takeaway": None} for i in range(1, 6)])
+    await env.run()
+    assert {r["Чат"] for r in rows(env, "decision")} == {"Маркетинг", "Продукт"}
+
+
+async def test_a_decision_removed_by_the_user_never_comes_back(env):
     answer(env, key_decisions=[{"id": "D1", "takeaway": None}])
     await env.run()
-    page = next(p for p in env.notion.decisions.values() if p["props"].get("Важливе"))
-    page["props"]["Важливе"] = {"checkbox": False}
+    next(iter(env.notion.decisions.values()))["in_trash"] = True
 
-    env.llm.queue = []
     answer(env, key_decisions=[{"id": "D1", "takeaway": "знову важливе"}])
-    env.db.conn.execute("UPDATE project_briefs SET input_hash = '{}'")  # the same decision is shown to the model again
+    env.db.conn.execute("UPDATE project_briefs SET input_hash = '{\"_v\": 2}'")  # the model sees the same days again
     await next_day(env, 21)
 
-    assert page["props"]["Важливе"] == {"checkbox": False}
+    assert "D1" in env.llm.brief_prompts[1] and rows(env, "decision") == []
 
 
-async def test_users_own_conclusion_is_kept_when_a_decision_is_marked(env):
-    env.now = env.now.replace(hour=2)  # 04:00 in Kyiv: decisions are exported, the daily update has not run yet
+async def test_a_decision_already_in_the_log_is_not_rewritten_on_every_run(env):
+    answer(env, key_decisions=[{"id": "D1", "takeaway": "Щоб дотестувати"}])
     await env.run()
-    for page in env.notion.decisions.values():
-        page["props"]["Висновок"] = {"rich_text": [{"text": {"content": "мій висновок"}}]}
-    env.now = env.now.replace(hour=10)
-    answer(env, key_decisions=[{"id": "D1", "takeaway": "висновок моделі"}])
+    answer(env, key_decisions=[{"id": "D1", "takeaway": "Інші слова про те саме"}])
+    env.db.conn.execute("UPDATE project_briefs SET input_hash = '{\"_v\": 2}'")  # the model sees the same days again
+    await next_day(env, 21)
+    assert [r["Висновок"] for r in rows(env, "decision")] == ["Щоб дотестувати"]
+
+
+async def test_a_new_passport_format_rebuilds_every_project_once_the_same_day(env):
     await env.run()
-    marked = [r for r in rows(env, "decision") if r.get("Важливе")]
-    assert [r["Висновок"] for r in marked] == ["мій висновок"]
+    env.db.conn.execute("UPDATE project_briefs SET input_hash = replace(input_hash, '\"_v\": 2', '\"_v\": 1')")
+    env.db.kv_set("project_briefs_done_on", "2026-11-20 v1")
+    for _ in range(2):
+        await env.run()
+    assert env.llm.brief_calls == 2 and '"date": "2026-11-20"' in env.llm.brief_prompts[1]
+
+
+async def test_decision_that_left_the_summary_leaves_the_log(env):
+    answer(env, key_decisions=[{"id": "D2", "takeaway": None}])
+    await env.run()
+    env.llm.queue = [json.dumps(GOOD_SUMMARY | {"decisions": ["Бюджет $700 погоджено"]}, ensure_ascii=False)]
+    env.source.add(MARKETING, 2, "Бюджет підняли до 700", at(20, 23))
+    env.now = env.now.replace(hour=21, minute=30)  # still 20.11 in Kyiv: the summary of the day changes
+    await env.run()
+    answer(env, key_decisions=[{"id": "D1", "takeaway": None}])
+    await next_day(env, 21)
+
+    assert [r["Запис"] for r in rows(env, "decision")] == ["Бюджет $700 погоджено"]
+    assert "REMOVED BY THE USER: none" in env.llm.brief_prompts[1]  # it is not the user who removed it
+
+
+async def test_decision_the_user_worked_on_stays_even_if_the_summary_changed(env):
+    answer(env, key_decisions=[{"id": "D2", "takeaway": None}])
+    await env.run()
+    page = next(iter(env.notion.decisions.values()))
+    page["props"]["Висновок"] = {"rich_text": [{"text": {"content": "мій висновок"}}]}
+    env.llm.queue = [json.dumps(GOOD_SUMMARY | {"decisions": []}, ensure_ascii=False)]
+    env.source.add(MARKETING, 2, "Скасували", at(20, 23))
+    env.now = env.now.replace(hour=21, minute=30)
+    await env.run()
+    await next_day(env, 21)
+    assert [r["Висновок"] for r in rows(env, "decision")] == ["мій висновок"]
+
+
+async def test_decisions_of_a_day_that_became_empty_leave_the_log(env):
+    answer(env, key_decisions=[{"id": "D1", "takeaway": None}, {"id": "D2", "takeaway": None}])
+    await env.run()
+    env.db.conn.execute("UPDATE summaries SET status = 'no_signal' WHERE chat_id = ?", (MARKETING,))
+    env.now += timedelta(days=1)
+    await env.run()  # no new summaries: no LLM call is needed for this
+    assert [r["Чат"] for r in rows(env, "decision")] == ["Продукт"] and env.llm.brief_calls == 1
 
 
 # ------------------------------------------------------------- one event = one row
@@ -106,7 +153,7 @@ async def test_result_of_a_test_updates_its_row_instead_of_adding_a_new_one(env)
     answer(env, log=[TEST])
     await env.run()
     (row,) = rows(env, "experiment")
-    assert (row["Ефект"], row["Важливе"], row["Результат"]) == ("🔄 У процесі", True, "")
+    assert (row["Ефект"], row["Результат"]) == ("🔄 У процесі", "")
 
     answer(env, log=[TEST | {"id": "L1", "date": "2026-11-21", "result": "CTR 0.4%, дорожче TikTok удвічі",
                              "effect": "failed", "takeaway": "Не повторювати Reels без нового креативу"}])
@@ -200,7 +247,7 @@ async def test_rows_added_by_the_user_are_shown_to_the_model_but_never_changed(e
     await env.run()
     (project_id,) = env.notion.projects
     own = {"Запис": {"title": [{"text": {"content": "A/B пейволу: річна підписка"}}]}, "Дата": {"date": {"start": "2026-11-21"}},
-           "Тип": {"select": {"name": LOG_TYPES["experiment"]}}, "Важливе": {"checkbox": True},
+           "Тип": {"select": {"name": LOG_TYPES["experiment"]}},
            "Проєкт": {"relation": [{"id": project_id}]}}
     env.notion.store["mine"] = {"ds": "ds-4", "key": "", "props": dict(own), "children": [], "icon": None, "in_trash": False}
 
@@ -211,13 +258,12 @@ async def test_rows_added_by_the_user_are_shown_to_the_model_but_never_changed(e
     assert env.notion.store["mine"]["props"] == own and len(rows(env, "experiment")) == 1
 
 
-async def test_row_of_a_decision_or_task_in_the_trash_does_not_block_the_export(env):
+async def test_task_in_the_trash_does_not_block_the_export(env):
     await env.run()
-    next(iter(env.notion.decisions.values()))["in_trash"] = True
     next(iter(env.notion.tasks.values()))["in_trash"] = True
     env.db.conn.execute("UPDATE summaries SET notion_synced_hash = NULL")  # every day is exported again
     report = await env.run()
-    assert report["notion"]["failed"] == 0 and len(env.notion.decisions) == 1 and len(env.notion.tasks) == 1
+    assert report["notion"]["failed"] == 0 and len(env.notion.tasks) == 1
 
 
 async def test_team_section_is_created_once_and_never_touched_again(env):
@@ -266,64 +312,64 @@ async def test_milestones_are_sorted_and_future_ones_are_marked_as_plans(env):
     assert text.index("19.11.2026 — Реліз 2.4") < text.index("05.12.2026 — Реліз 2.5 (план)") and "Без дати" not in text
 
 
-# --------------------------------------------------------------------- migration
+# ------------------------------------------------------------ where the log lives
 
 
-async def test_first_version_of_the_databases_is_migrated_in_place(env):
-    """Databases as the first release made them: two-way links, counters, «Рішення» as a title, three tables."""
+async def test_log_database_lives_on_the_service_page_not_on_the_main_one(env):
+    await env.run()
+    ((page_id, page),) = env.notion.child_pages.items()
+    assert page["title"] == "Службове" and page["parent"] == "0" * 32
+    assert env.notion.database_parents["db-4"] == page_id
+    assert [env.notion.database_parents[f"db-{i}"] for i in (1, 2, 3)] == ["0" * 32] * 3
+    await next_day(env, 21)
+    assert len(env.notion.child_pages) == 1
+
+
+async def test_service_page_is_found_again_after_a_crash(env):
+    env.notion.child_pages["half-done"] = {"parent": "0" * 32, "title": "Службове", "children": []}
+    await env.run()
+    assert list(env.notion.child_pages) == ["half-done"] and env.db.kv_get(KV_SERVICE_PAGE) == "half-done"
+
+
+async def test_previous_version_of_the_log_is_migrated_in_place(env):
+    """Before: ALL decisions as rows, a «Важливе» checkbox, the «Усі записи» view, the database on the main page."""
+    answer(env, key_decisions=[{"id": "D1", "takeaway": None}], log=[TEST])
     await env.run()
     n, db = env.notion, env.db
-    (project_id, project), = n.projects.items()
-    for ds, mirror in (("ds-2", "Задачі"), ("ds-4", "Рішення")):
-        rel = n.data_sources[ds]["properties"]["Проєкт"]["relation"]
-        rel |= {"type": "dual_property", "dual_property": {"synced_property_name": mirror}}
-        n.data_sources["ds-3"]["properties"][mirror] = {"id": f"mirror-{mirror}", "type": "relation"}
-    await n.data_sources_api.update("ds-4", {"Запис": {"name": "Рішення"}})
-    await n.data_sources_api.update("ds-3", {"Оновлено": {"name": "Бриф оновлено"}})
-    for name in ("Тип", "Важливе", "Результат", "Ефект", "Висновок", "Метрика", "Значення"):
-        await n.data_sources_api.update("ds-4", {name: None})
-    ids = json.loads(db.kv_get(KV_DECISION_PROP_IDS))
-    db.kv_set(KV_DECISION_PROP_IDS, json.dumps({"Рішення": ids["Запис"]} | {k: ids[k] for k in ("Дата", "Чат", "Проєкт", "Key")}))
-    ids = json.loads(db.kv_get(KV_PROJECT_PROP_IDS))
-    ids["Бриф оновлено"] = ids.pop("Оновлено")
-    for name in ("Відкритих задач", "Рішень", "Key"):
-        n.data_sources["ds-3"]["properties"][name] = {"id": f"old-{name}", "type": "number"}
-        ids[name] = f"old-{name}"
-    db.kv_set(KV_PROJECT_PROP_IDS, json.dumps(ids))
-    n.database_titles["db-4"] = "Telegram — рішення"
-    children = n.store[project_id]["children"]
-    del children[1:]  # the first page had the brief and three tables
-    stored = {}
-    for key, ds in (("decisions", "ds-4"), ("tasks", "ds-2"), ("checklist", "ds-2")):
-        view = await n.request("views", "POST", {"create_database": {"parent": {"type": "page_id", "page_id": project_id}},
-                                                 "data_source_id": ds, "name": key, "type": "table"})
-        stored[key] = {"id": view["id"], "release": None}
-    children.append({"id": "users-note", "type": "paragraph", "paragraph": {"rich_text": []}})
-    n.parent_of["users-note"] = project_id
-    db.kv_set(f"project_views:{project_id}", json.dumps(stored))
-    db.conn.execute("DELETE FROM kv WHERE key LIKE 'project_team_section:%'")
-    db.kv_set(KV_PROJECTS_LAYOUT, "1")
-    db.kv_set("project_briefs_done_on", "2026-11-20")  # the first version already ran today
-    db.kv_set(f"project_brief_rendered:{project_id}", "2026-11-20")
-    db.conn.execute("UPDATE project_briefs SET input_hash = replace(input_hash, '\"_v\": 2', '\"_v\": 1')")
-    rows_before = (len(n.decisions), len(n.tasks), [t["props"]["Проєкт"] for t in n.tasks.values()])
-    answer(env, log=[TEST])
+    (project_id,) = n.projects
+    await n.data_sources_api.update("ds-4", {"Важливе": {"checkbox": {}}})
+    ids = json.loads(db.kv_get(KV_LOG_PROP_IDS))
+    important = n.data_sources["ds-4"]["properties"]["Важливе"]["id"]
+    db.kv_set(KV_LOG_PROP_IDS, json.dumps(ids | {"Важливе": important}))
+    for page in n.decisions.values():
+        page["props"]["Важливе"] = {"checkbox": True}
+    routine = {"Запис": {"title": [{"text": {"content": "Планерка о 10:00"}}]}, "Тип": {"select": {"name": LOG_TYPES["decision"]}},
+               "Важливе": {"checkbox": False}, "Проєкт": {"relation": [{"id": project_id}]},
+               "Key": {"rich_text": [{"text": {"content": "-1001:2026-11-20:abc"}}]}}
+    users = {k: v for k, v in routine.items() if k != "Key"}  # added by hand: no Key
+    for pid, props in (("routine", routine), ("users", users)):
+        n.store[pid] = {"ds": "ds-4", "key": "", "props": dict(props), "children": [], "icon": None, "in_trash": False}
+    await n.request("views", "POST", {"database_id": "db-4", "data_source_id": "ds-4", "name": "🗂 Усі записи", "type": "table"})
+    for view in n.views.values():
+        if view["name"] in ("📒 Важливе", "🧪 Тести", "📊 Динаміка"):
+            view["filter"] = {"and": [{"property": important, "checkbox": {"equals": True}}]}
+    n.database_parents["db-4"] = "0" * 32
+    n.child_pages.clear()
+    db.conn.execute("DELETE FROM kv WHERE key = ?", (KV_SERVICE_PAGE,))
+    db.kv_set(KV_PROJECTS_LAYOUT, "2")
+    before = {r["_id"] for r in rows(env)} - {"routine"}
 
     report = await env.run()
 
-    assert report["status"] == "ok" and env.llm.brief_calls == 2  # rebuilt once in the new format, the same day
-    assert set(n.data_sources["ds-3"]["properties"]) == {"Проєкт", "Чати", "Статус", "Дата релізу", "Оновлено"}
-    for ds in ("ds-2", "ds-4"):
-        assert n.data_sources[ds]["properties"]["Проєкт"]["relation"]["type"] == "single_property"
-    assert len(rows(env, "decision")) == 2  # old decision rows got their type
-    assert {"Запис", "Тип", "Важливе", "Ефект"} <= set(n.data_sources["ds-4"]["properties"])
-    assert "Рішення" not in n.data_sources["ds-4"]["properties"] and n.database_titles["db-4"] == "Telegram — журнал проєкту"
-    assert (len(n.decisions) - 1, len(n.tasks), [t["props"]["Проєкт"] for t in n.tasks.values()]) == rows_before
+    assert report["status"] == "ok" and {r["_id"] for r in rows(env)} == before and "users" in before
+    assert "Важливе" not in n.data_sources["ds-4"]["properties"]
+    assert n.view_names("db-4") == ["📒 Важливе", "🧪 Тести", "📊 Динаміка"]
     assert n.page_view_names(project_id) == ["📒 Важливе", "🧪 Тести", "📊 Динаміка"]
-    assert "users-note" in [b["id"] for b in children]  # the user's own block stays
-    assert json.loads(db.kv_get(KV_TASK_PROP_IDS))["Проєкт"] == n.data_sources["ds-2"]["properties"]["Проєкт"]["id"]
+    assert not any(important in json.dumps(v.get("filter") or {}) for v in n.views.values())
+    (service,) = n.child_pages
+    assert n.database_parents["db-4"] == service
     again = await env.run()
-    assert again["projects"] == {"skipped": "already updated today"} and again["notion"]["updated"] == 0
+    assert again["projects"] == {"skipped": "already updated today"} and len(n.child_pages) == 1
 
 
 async def test_columns_renamed_by_the_user_are_followed_in_the_log(env):

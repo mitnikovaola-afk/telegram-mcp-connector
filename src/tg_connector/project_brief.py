@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 from .config import Settings
 from .db import Database
 from .llm import LLMClient, LLMError
-from .notion_layout import PROJECT_DONE, select_name
+from .notion_layout import PROJECT_DONE, decision_key, select_name
 from .notion_sink import NotionSink
 from .project_log import LOG_RULES, KeyDecision, LogContext, LogItem
 from .summarizer import (
@@ -77,7 +77,7 @@ PASSPORT:
 - owners: at most 8, names exactly as in the summaries. risks, next_steps, open_questions: at most 5 each, one short sentence.
 - risks: also compare every open task with absences mentioned in the summaries (vacation, sick leave): a task whose owner is away on its due date is a risk, and so is a dated task nobody owns.
 - A question that was answered, a task that was done, a risk that went away must not stay.
-- milestones: at most 12, oldest first: releases, launches, first results, strategic turns and dated plans for them. Not meetings, not tasks. Keep earlier ones from the previous passport.
+- milestones: at most 12, oldest first: releases, launches, first results, strategic turns and dated plans for them, each a short noun phrase (a plan is marked as a plan automatically, do not write it). Not meetings, not tasks. Keep earlier ones from the previous passport.
 - In the texts dates are DD.MM.
 
 {log_rules}
@@ -158,6 +158,17 @@ def _day_hash(day: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(content, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
 
 
+def _left_summaries(stored: list[Any], changed_days: list[Any], gone_days: list[str]) -> list[int]:
+    """Log rows of decisions that are no longer in the summary of their day (it changed or became empty)."""
+    now_there: dict[str, set[str]] = {f"decision:{key}:": set() for key in gone_days}
+    for r in changed_days:
+        day = _day_view(r)
+        now_there[f"decision:{r['chat_id']}:{r['local_date']}:"] = {
+            "decision:" + decision_key(r["chat_id"], r["local_date"], text) for text in day["decisions"]}
+    return [row["id"] for row in stored if row["state"] in ("dirty", "synced")
+            for prefix, keys in now_there.items() if row["entry_key"].startswith(prefix) and row["entry_key"] not in keys]
+
+
 async def update_briefs(db: Database, llm: LLMClient, sink: NotionSink, settings: Settings, now: datetime,
                         heartbeat: Any = lambda: None) -> dict[str, Any]:
     stats: dict[str, Any] = {"updated": 0, "unchanged": 0, "llm_calls": 0, "log_rows": 0, "failed": 0, "errors": []}
@@ -209,7 +220,11 @@ async def update_briefs(db: Database, llm: LLMClient, sink: NotionSink, settings
             current = {f"{r['chat_id']}:{r['local_date']}": _day_hash(_day_view(r)) for r in rows}
             fresh = [r for r in rows if included.get(key := f"{r['chat_id']}:{r['local_date']}") != current[key]]
             days = [_day_view(r) for r in fresh]
+            gone_days = [key for key in included if key not in current and key.rpartition(":")[2] >= since]
+            obsolete = _left_summaries(db.project_log(page_id), fresh, gone_days)
             if not days:
+                for row_id in obsolete:
+                    db.set_log_state(row_id, "obsolete")
                 if stored:
                     db.mark_project_brief_checked(page_id, today.isoformat())
                 brief, model, done_on = None, None, None
@@ -250,10 +265,8 @@ async def update_briefs(db: Database, llm: LLMClient, sink: NotionSink, settings
                 stats["updated"] += 1
                 brief, model, done_on = _cap(result), llm.model_name, today.isoformat()
                 entries = ctx.apply(result.key_decisions, result.log, since, today.isoformat())
-                for row_id in ctx.removed_ids:
-                    db.dismiss_log_row(row_id)
                 db.save_project_brief(page_id, brief, done_on, json.dumps(current | {"_v": BRIEF_VERSION}, sort_keys=True),
-                                      model, entries)
+                                      model, entries, ctx.removed_ids, obsolete)
                 log.info("Passport of project «%s» updated from %d day summaries, %d log entries new or changed",
                          project["title"], len(days), len(entries))
         try:

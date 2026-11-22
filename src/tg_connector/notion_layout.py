@@ -380,14 +380,13 @@ build_properties = build_day_properties
 
 PROJECTS_TITLE = "Telegram — проєкти"
 LOG_TITLE = "Telegram — журнал проєкту"
-OLD_LOG_TITLE = "Telegram — рішення"  # the first version of this database held decisions only
+SERVICE_TITLE = "Службове"  # page for databases people reach through other pages
 PROJECT_ACTIVE, PROJECT_PAUSED, PROJECT_DONE = "Активний", "На паузі", "Завершено"
 # Columns the USER owns on a project (set once on creation, never overwritten by the connector).
 PROJECT_USER_COLUMNS = ("Проєкт", "Чати", "Статус", "Дата релізу")
 
-LOG_DECISION = "🎯 Рішення"
 LOG_TYPES = {
-    "decision": LOG_DECISION,
+    "decision": "🎯 Рішення",
     "experiment": "🧪 Тест",
     "analytics": "📊 Аналітика",
     "release": "🚀 Реліз",
@@ -395,7 +394,7 @@ LOG_TYPES = {
 }
 LOG_EFFECTS = {"worked": "✅ Спрацювало", "failed": "❌ Не спрацювало", "in_progress": "🔄 У процесі"}
 # Columns the connector fills on log rows; whatever the user changes there afterwards stays the user's.
-LOG_AI_COLUMNS = ("Запис", "Дата", "Тип", "Результат", "Ефект", "Висновок", "Метрика", "Значення")
+LOG_AI_COLUMNS = ("Запис", "Дата", "Тип", "Результат", "Ефект", "Висновок", "Метрика", "Значення", "Чат")
 
 
 def project_properties_schema() -> dict[str, Any]:
@@ -436,7 +435,6 @@ def log_properties_schema(projects_data_source_id: str) -> dict[str, Any]:
                 ]
             }
         },
-        "Важливе": {"checkbox": {}},
         "Результат": {"rich_text": {}},
         "Ефект": {
             "select": {
@@ -461,22 +459,9 @@ def decision_key(chat_id: int, local_date: str, text: str) -> str:
     return f"{chat_id}:{local_date}:{digest}"
 
 
-def build_decision_properties(row: Any, text: str, key: str, project_ids: list[str], *, new: bool) -> dict[str, Any]:
-    """A decision as it stands in the day summary. Type, importance and conclusion are set later (by the daily
-    update) or by the user, so an update of the row never touches them."""
-    props = {
-        "Запис": {"title": [_rt(text)]},
-        "Дата": {"date": {"start": row["local_date"]}},
-        "Чат": {"select": {"name": _select_name(row["title"] or str(row["chat_id"]))}},
-        "Проєкт": {"relation": [{"id": pid} for pid in project_ids]},
-        "Key": {"rich_text": [_rt(key)]},
-    }
-    return props | {"Тип": {"select": {"name": LOG_DECISION}}} if new else props
-
-
 def build_log_properties(entry: dict[str, Any]) -> dict[str, Any]:
-    """Columns of a log row written by the daily update (tests, analytics, releases, problems)."""
-    metric = _select_name(entry.get("metric") or "")
+    """Columns of a log row. The chat is known for decisions only: other events are gathered from all chats."""
+    metric, chat = _select_name(entry.get("metric") or ""), _select_name(entry.get("chat") or "")
     effect = LOG_EFFECTS.get(entry.get("effect") or "")
     return {
         "Запис": {"title": [_rt(entry["title"])]},
@@ -487,6 +472,7 @@ def build_log_properties(entry: dict[str, Any]) -> dict[str, Any]:
         "Висновок": {"rich_text": [_rt(entry["takeaway"])] if entry.get("takeaway") else []},
         "Метрика": {"select": {"name": metric} if metric else None},
         "Значення": {"number": entry.get("value")},
+        "Чат": {"select": {"name": chat} if chat else None},
     }
 
 
@@ -502,7 +488,12 @@ def plain_value(prop: dict[str, Any] | None) -> Any:
         return (prop["date"] or {}).get("start")
     if "number" in prop:
         return prop["number"]
-    return bool(prop.get("checkbox"))
+    return None
+
+
+def build_service_page() -> list[dict[str, Any]]:
+    return [_block("paragraph", [_rt("Тут лежить журнал проєктів: із нього будуються таблиці на сторінках проєктів. "
+                                     "Видаляти його не потрібно.", color="gray")])]
 
 
 def build_new_project_properties(chat_name: str) -> dict[str, Any]:

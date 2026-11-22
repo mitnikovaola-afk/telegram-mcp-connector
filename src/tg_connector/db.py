@@ -109,14 +109,6 @@ CREATE TABLE IF NOT EXISTS notion_tasks (
     PRIMARY KEY (chat_id, local_date, task_key)
 );
 
-CREATE TABLE IF NOT EXISTS notion_decisions (
-    chat_id      INTEGER NOT NULL,
-    local_date   TEXT    NOT NULL,
-    decision_key TEXT    NOT NULL,
-    page_id      TEXT    NOT NULL,
-    PRIMARY KEY (chat_id, local_date, decision_key)
-);
-
 CREATE TABLE IF NOT EXISTS project_briefs (
     project_page_id TEXT PRIMARY KEY,
     brief_json      TEXT NOT NULL,
@@ -129,11 +121,12 @@ CREATE TABLE IF NOT EXISTS project_briefs (
 CREATE TABLE IF NOT EXISTS project_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     project_page_id TEXT NOT NULL,
-    entry_key       TEXT NOT NULL,       -- type:date:hash(title) · analytics:date:metric · decision:<decision key>
+    entry_key       TEXT NOT NULL,       -- type:date:hash(title) · analytics:date:metric · decision:chat:date:hash
     entry_json      TEXT NOT NULL,       -- what should stand in Notion
     written_json    TEXT,                -- what the connector wrote last (Notion differs = the user's edit)
     page_id         TEXT,
-    state           TEXT NOT NULL DEFAULT 'dirty',   -- dirty | synced | dismissed (the user removed the row)
+    state           TEXT NOT NULL DEFAULT 'dirty',   -- dirty | synced | dismissed (removed by the user)
+                                                     -- obsolete (left the summary) | retired (its row is gone too)
     created_on      TEXT NOT NULL,
     UNIQUE (project_page_id, entry_key)
 );
@@ -551,44 +544,22 @@ class Database:
                 (chat_id, local_date, task_key),
             )
 
-    def notion_decisions_for_day(self, chat_id: int, local_date: str) -> dict[str, str]:
-        rows = self.conn.execute(
-            "SELECT decision_key, page_id FROM notion_decisions WHERE chat_id = ? AND local_date = ?", (chat_id, local_date)
-        )
-        return {r["decision_key"]: r["page_id"] for r in rows}
-
-    def save_notion_decision(self, chat_id: int, local_date: str, key: str, page_id: str) -> None:
-        with self.tx() as c:
-            c.execute(
-                """INSERT INTO notion_decisions (chat_id, local_date, decision_key, page_id) VALUES (?, ?, ?, ?)
-                   ON CONFLICT(chat_id, local_date, decision_key) DO UPDATE SET page_id = excluded.page_id""",
-                (chat_id, local_date, key, page_id),
-            )
-
-    def forget_notion_decision(self, chat_id: int, local_date: str, key: str) -> None:
-        with self.tx() as c:
-            c.execute(
-                "DELETE FROM notion_decisions WHERE chat_id = ? AND local_date = ? AND decision_key = ?",
-                (chat_id, local_date, key),
-            )
-
-    def notion_decision_page(self, key: str) -> str | None:
-        row = self.conn.execute("SELECT page_id FROM notion_decisions WHERE decision_key = ?", (key,)).fetchone()
-        return row["page_id"] if row else None
-
     def get_project_brief(self, page_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM project_briefs WHERE project_page_id = ?", (page_id,)).fetchone()
 
     def save_project_brief(self, page_id: str, brief: dict[str, Any], updated_on: str, input_hash: str, model: str,
-                           log: dict[str, dict[str, Any]] | None = None) -> None:
-        """The passport and its new/changed log entries ({entry_key: entry}) in ONE transaction."""
+                           log: dict[str, dict[str, Any]] | None = None, dismissed: list[int] = (),
+                           obsolete: list[int] = ()) -> None:
+        """The passport and its log changes ({entry_key: entry}, rows that left the log) in ONE transaction."""
         with self.tx() as c:
+            c.executemany("UPDATE project_log SET state = 'dismissed' WHERE id = ?", [(i,) for i in dismissed])
+            c.executemany("UPDATE project_log SET state = 'obsolete' WHERE id = ?", [(i,) for i in obsolete])
             for key, entry in (log or {}).items():
                 c.execute(
                     """INSERT INTO project_log (project_page_id, entry_key, entry_json, created_on) VALUES (?, ?, ?, ?)
                        ON CONFLICT(project_page_id, entry_key) DO UPDATE
                            SET entry_json = excluded.entry_json, state = 'dirty'
-                           WHERE state != 'dismissed' AND entry_json != excluded.entry_json""",
+                           WHERE state != 'dismissed' AND (entry_json != excluded.entry_json OR state IN ('obsolete', 'retired'))""",
                     (page_id, key, json.dumps(entry, ensure_ascii=False, sort_keys=True), updated_on),
                 )
             c.execute(
@@ -621,9 +592,15 @@ class Database:
             c.execute("UPDATE project_log SET page_id = ?, written_json = ?, state = 'synced' WHERE id = ?",
                       (page_id, json.dumps(written, ensure_ascii=False) if written is not None else None, row_id))
 
-    def dismiss_log_row(self, row_id: int) -> None:
+    def retire_log_row(self, row_id: int, *, row_removed: bool) -> None:
         with self.tx() as c:
-            c.execute("UPDATE project_log SET state = 'dismissed' WHERE id = ?", (row_id,))
+            c.execute("UPDATE project_log SET state = 'retired', page_id = CASE WHEN ? THEN NULL ELSE page_id END, "
+                      "written_json = CASE WHEN ? THEN NULL ELSE written_json END WHERE id = ?",
+                      (row_removed, row_removed, row_id))
+
+    def set_log_state(self, row_id: int, state: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE project_log SET state = ? WHERE id = ?", (state, row_id))
 
     # ------------------------------------------------------------------- runs
     def start_run(self, trigger: str) -> int:

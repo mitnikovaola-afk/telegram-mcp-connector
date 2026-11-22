@@ -196,15 +196,14 @@ def log_views(ids: dict[str, str], project_page_id: str | None = None) -> list[d
     def only(*conditions: dict[str, Any]) -> dict[str, Any]:
         return {"and": [*in_project, *conditions]}
 
-    important = {"property": ids["Важливе"], "checkbox": {"equals": True}}
     newest_first = [{"property": ids["Дата"], "direction": "descending"}]
-    specs: list[dict[str, Any]] = [
+    return [
         {
             "key": "important",
             "name": "📒 Важливе",
             "type": "table",
             "default": True,
-            "filter": only(important),
+            **({"filter": only()} if in_project else {}),
             "sorts": newest_first,
             "quick_filters": {ids["Тип"]: {}, ids["Ефект"]: {}},
             "configuration": _log_table(ids, ["Запис", "Дата", "Тип", "Результат", "Ефект", "Висновок"]),
@@ -213,7 +212,7 @@ def log_views(ids: dict[str, str], project_page_id: str | None = None) -> list[d
             "key": "tests",
             "name": "🧪 Тести",
             "type": "table",
-            "filter": only(important, {"property": ids["Тип"], "select": {"equals": LOG_TYPES["experiment"]}}),
+            "filter": only({"property": ids["Тип"], "select": {"equals": LOG_TYPES["experiment"]}}),
             "sorts": newest_first,
             "configuration": _log_table(ids, ["Запис", "Дата", "Ефект", "Результат", "Висновок"]),
         },
@@ -221,7 +220,7 @@ def log_views(ids: dict[str, str], project_page_id: str | None = None) -> list[d
             "key": "dynamics",
             "name": "📊 Динаміка",
             "type": "table",
-            "filter": only(important, {"property": ids["Тип"], "select": {"equals": LOG_TYPES["analytics"]}}),
+            "filter": only({"property": ids["Тип"], "select": {"equals": LOG_TYPES["analytics"]}}),
             "sorts": [{"property": ids["Дата"], "direction": "ascending"}],
             "configuration": _log_table(
                 ids, ["Запис", "Дата", "Значення", "Результат", "Висновок"],
@@ -230,16 +229,6 @@ def log_views(ids: dict[str, str], project_page_id: str | None = None) -> list[d
             ),
         },
     ]
-    if project_page_id is None:
-        specs.append({
-            "key": "all",
-            "name": "🗂 Усі записи",
-            "type": "table",
-            "sorts": newest_first,
-            "quick_filters": {ids["Тип"]: {}, ids["Проєкт"]: {}, ids["Чат"]: {}},
-            "configuration": _log_table(ids, ["Запис", "Дата", "Тип", "Важливе", "Проєкт", "Чат"]),
-        })
-    return specs
 
 
 def view_body(spec: dict[str, Any]) -> dict[str, Any]:

@@ -89,20 +89,19 @@ async def test_user_owned_columns_are_never_overwritten(env):
     assert len(env.notion.projects) == 1  # and no new project for the chat the user removed
 
 
-# ---------------------------------------------------------------- decision log
+# ---------------------------------------------------------------- links of tasks
 
 
-async def test_decisions_and_tasks_are_linked_to_the_project_and_never_duplicated(env):
+async def test_tasks_are_linked_to_the_project_and_never_duplicated(env):
     single(env)
     await env.run()
     (project_id,) = env.notion.projects
-    assert len(env.notion.decisions) == 2  # marketing and product; decisions of the private chat stay out of the log
-    assert all(d["props"]["Проєкт"]["relation"] == [{"id": project_id}] for d in env.notion.decisions.values())
-    assert sum(bool(t["props"]["Проєкт"]["relation"]) for t in env.notion.tasks.values()) == 2
+    links = [t["props"]["Проєкт"]["relation"] for t in env.notion.tasks.values()]
+    assert sorted(links, key=len) == [[], [{"id": project_id}], [{"id": project_id}]]  # the private chat has no project
 
     env.db.conn.execute("UPDATE summaries SET notion_synced_hash = NULL")  # e.g. a new page layout
     await env.run()
-    assert len(env.notion.decisions) == 2
+    assert len(env.notion.tasks) == 3
 
 
 async def test_links_of_old_days_follow_when_the_user_changes_the_chats_column(env):
@@ -118,26 +117,12 @@ async def test_links_of_old_days_follow_when_the_user_changes_the_chats_column(e
         return {r["props"]["Чат"]["select"]["name"]: bool(r["props"]["Проєкт"]["relation"]) for r in store.values()}
 
     assert linked(env.notion.tasks) == {"Маркетинг": False, "Продукт": True, "Олег": True}
-    assert linked(env.notion.decisions) == {"Маркетинг": False, "Продукт": True, "Олег": True}  # chosen by the user
 
     project["props"]["Чати"] = {"multi_select": [{"name": "Продукт"}]}
     await env.run()
-    assert linked(env.notion.decisions) == {"Маркетинг": False, "Продукт": True}  # the private chat left the log again
+    assert linked(env.notion.tasks) == {"Маркетинг": False, "Продукт": True, "Олег": False}
     assert env.llm.calls == llm_calls  # links need no LLM
     assert (await env.run())["notion"]["updated"] == 0  # and the days are exported only once per change
-
-
-async def test_decision_that_left_the_summary_leaves_the_log(env):
-    single(env)
-    await env.run()
-    env.llm.queue = [json.dumps(dict(GOOD_SUMMARY, decisions=["Бюджет $700 погоджено"]), ensure_ascii=False)]
-    env.source.add(MARKETING, 2, "Бюджет підняли до 700", at(20, 13))
-
-    await env.run()
-
-    texts = [d["props"]["Запис"]["title"][0]["text"]["content"] for d in env.notion.decisions.values()
-             if d["props"]["Чат"]["select"]["name"] == "Маркетинг"]
-    assert texts == ["Бюджет $700 погоджено"]
 
 
 # ----------------------------------------------------------------- daily brief
@@ -331,7 +316,8 @@ async def test_project_setup_failure_does_not_block_summaries_and_tasks(env):
     env.source.add(MARKETING, 2, "Новина", at(20, 13))
     second = await env.run()
     assert second["status"] == "ok" and len(env.notion.projects) == 1
-    assert len(env.notion.decisions) == 2  # also for the days exported while projects were broken
+    linked = [t for t in env.notion.tasks.values() if t["props"].get("Проєкт", {}).get("relation")]
+    assert len(linked) == 2  # also tasks of the days exported while projects were broken
     assert (await env.run())["notion"]["updated"] == 0  # caught up once, not on every run
 
 
