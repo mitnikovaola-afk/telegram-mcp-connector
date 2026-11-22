@@ -209,15 +209,9 @@ class FakeNotion:
             return {"id": db_id, "url": f"https://notion.so/{db_id}", "data_sources": [{"id": ds_id}]}
 
         async def db_update(database_id, **kw):
-            if "parent" in kw:
-                self.database_parents[database_id] = kw["parent"]["page_id"]
             if "title" in kw:
                 self.database_titles[database_id] = kw["title"][0]["text"]["content"]
             return {"id": database_id}
-
-        async def db_retrieve(database_id):
-            return {"id": database_id, "title": [{"plain_text": self.database_titles.get(database_id, "")}],
-                    "parent": {"type": "page_id", "page_id": self.database_parents.get(database_id)}}
 
         async def ds_retrieve(data_source_id):
             return {"id": data_source_id, "properties": dict(self.data_sources[data_source_id]["properties"])}
@@ -226,21 +220,13 @@ class FakeNotion:
             props = self.data_sources[data_source_id]["properties"]
             rows = [p for p in self.store.values() if p["ds"] == data_source_id]
             for name, spec in (properties or {}).items():
-                if spec is None:  # delete the column
-                    props.pop(name)
-                    for row in rows:
-                        row["props"].pop(name, None)
-                elif "name" in spec:  # rename: the id stays
+                if "name" in spec:  # rename: the id stays
                     props[spec["name"]] = props.pop(name)
                     for row in rows:
                         if name in row["props"]:
                             row["props"][spec["name"]] = row["props"].pop(name)
                 else:
-                    old = props.get(name, {}).get("relation") or {}
                     props[name] = column(props[name]["id"] if name in props else new_id("added-"), spec)
-                    if old.get("type") == "dual_property" and spec["relation"]["type"] == "single_property":
-                        # the mirror column on the other side disappears, the links of the rows stay (checked live)
-                        self.data_sources[old["data_source_id"]]["properties"].pop(old["dual_property"]["synced_property_name"], None)
             add_dual({k: v for k, v in (properties or {}).items() if v and "relation" in v})
             return {"id": data_source_id}
 
@@ -253,8 +239,6 @@ class FakeNotion:
             if "rich_text" in flt:
                 value = "".join(t["text"]["content"] for t in prop.get("rich_text", []))
                 return bool(value) if "is_not_empty" in flt["rich_text"] else value == flt["rich_text"]["equals"]
-            if "checkbox" in flt:
-                return bool(prop.get("checkbox")) == flt["checkbox"]["equals"]
             if "relation" in flt:
                 return flt["relation"]["contains"] in [r["id"] for r in prop.get("relation", [])]
             name = (prop.get("select") or {}).get("name")
@@ -358,8 +342,6 @@ class FakeNotion:
             if method == "PATCH" and path.startswith("views/"):
                 self.views[path.split("/", 1)[1]].update(body)
                 return self.views[path.split("/", 1)[1]]
-            if method == "DELETE" and path.startswith("views/"):
-                return self.views.pop(path.split("/", 1)[1])
             if method == "POST" and path == "views":
                 vid = new_id("view-")
                 self.views[vid] = {"id": vid, **body}
@@ -374,7 +356,7 @@ class FakeNotion:
                 return self.views[vid]
             raise AssertionError(f"unexpected request {method} {path}")
 
-        self.databases = SimpleNamespace(create=db_create, update=db_update, retrieve=db_retrieve)
+        self.databases = SimpleNamespace(create=db_create, update=db_update)
         self.data_sources_api = SimpleNamespace(retrieve=ds_retrieve, update=ds_update, query=ds_query)
         self.pages_api = SimpleNamespace(create=page_create, update=page_update, retrieve=page_retrieve)
         self.blocks = SimpleNamespace(delete=block_delete, update=block_update,

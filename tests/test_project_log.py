@@ -12,7 +12,7 @@ from conftest import GOOD_BRIEF, GOOD_SUMMARY, at
 from notion_client.errors import APIResponseError
 
 from tg_connector.notion_layout import LOG_TYPES
-from tg_connector.notion_sink import KV_LOG_PROP_IDS, KV_PROJECTS_LAYOUT, KV_SERVICE_PAGE
+from tg_connector.notion_sink import KV_SERVICE_PAGE
 from tg_connector.project_brief import ProjectBrief
 from tg_connector.project_log import LogContext
 
@@ -329,47 +329,6 @@ async def test_service_page_is_found_again_after_a_crash(env):
     env.notion.child_pages["half-done"] = {"parent": "0" * 32, "title": "Службове", "children": []}
     await env.run()
     assert list(env.notion.child_pages) == ["half-done"] and env.db.kv_get(KV_SERVICE_PAGE) == "half-done"
-
-
-async def test_previous_version_of_the_log_is_migrated_in_place(env):
-    """Before: ALL decisions as rows, a «Важливе» checkbox, the «Усі записи» view, the database on the main page."""
-    answer(env, key_decisions=[{"id": "D1", "takeaway": None}], log=[TEST])
-    await env.run()
-    n, db = env.notion, env.db
-    (project_id,) = n.projects
-    await n.data_sources_api.update("ds-4", {"Важливе": {"checkbox": {}}})
-    ids = json.loads(db.kv_get(KV_LOG_PROP_IDS))
-    important = n.data_sources["ds-4"]["properties"]["Важливе"]["id"]
-    db.kv_set(KV_LOG_PROP_IDS, json.dumps(ids | {"Важливе": important}))
-    for page in n.decisions.values():
-        page["props"]["Важливе"] = {"checkbox": True}
-    routine = {"Запис": {"title": [{"text": {"content": "Планерка о 10:00"}}]}, "Тип": {"select": {"name": LOG_TYPES["decision"]}},
-               "Важливе": {"checkbox": False}, "Проєкт": {"relation": [{"id": project_id}]},
-               "Key": {"rich_text": [{"text": {"content": "-1001:2026-11-20:abc"}}]}}
-    users = {k: v for k, v in routine.items() if k != "Key"}  # added by hand: no Key
-    for pid, props in (("routine", routine), ("users", users)):
-        n.store[pid] = {"ds": "ds-4", "key": "", "props": dict(props), "children": [], "icon": None, "in_trash": False}
-    await n.request("views", "POST", {"database_id": "db-4", "data_source_id": "ds-4", "name": "🗂 Усі записи", "type": "table"})
-    for view in n.views.values():
-        if view["name"] in ("📒 Важливе", "🧪 Тести", "📊 Динаміка"):
-            view["filter"] = {"and": [{"property": important, "checkbox": {"equals": True}}]}
-    n.database_parents["db-4"] = "0" * 32
-    n.child_pages.clear()
-    db.conn.execute("DELETE FROM kv WHERE key = ?", (KV_SERVICE_PAGE,))
-    db.kv_set(KV_PROJECTS_LAYOUT, "2")
-    before = {r["_id"] for r in rows(env)} - {"routine"}
-
-    report = await env.run()
-
-    assert report["status"] == "ok" and {r["_id"] for r in rows(env)} == before and "users" in before
-    assert "Важливе" not in n.data_sources["ds-4"]["properties"]
-    assert n.view_names("db-4") == ["📒 Важливе", "🧪 Тести", "📊 Динаміка"]
-    assert n.page_view_names(project_id) == ["📒 Важливе", "🧪 Тести", "📊 Динаміка"]
-    assert not any(important in json.dumps(v.get("filter") or {}) for v in n.views.values())
-    (service,) = n.child_pages
-    assert n.database_parents["db-4"] == service
-    again = await env.run()
-    assert again["projects"] == {"skipped": "already updated today"} and len(n.child_pages) == 1
 
 
 async def test_columns_renamed_by_the_user_are_followed_in_the_log(env):

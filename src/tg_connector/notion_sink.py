@@ -84,7 +84,6 @@ KV_PROJECT_PROP_IDS = "notion_project_property_ids"
 KV_LOG_PROP_IDS = "notion_decision_property_ids"
 KV_PROJECTS_LAYOUT = "notion_projects_layout_version"
 KV_DEFAULT_PROJECT = "project_default_page"
-# v3: the log keeps important entries only and lives on the service page.
 PROJECTS_LAYOUT_VERSION = "3"
 KV_SERVICE_PAGE = "notion_service_page"
 KV_TASK_PROJECT_READY = "notion_task_project_column_ready"  # the «Проєкт» column exists on tasks
@@ -227,7 +226,6 @@ class NotionSink:
             self.db.kv_set(KV_LOG_DATA_SOURCE, log_ds)
         if self.db.kv_get(KV_PROJECTS_LAYOUT) == PROJECTS_LAYOUT_VERSION:
             return projects_ds, log_ds
-        await self._migrate_to_v3(log_ds)
         with_project = task_properties_schema(days_ds) | {"Проєкт": project_relation_spec(projects_ds)}
         await self.property_names(tasks_ds, KV_TASK_PROP_IDS, with_project)  # adds «Проєкт» to tasks
         self.db.kv_set(KV_TASK_PROJECT_READY, "1")
@@ -270,61 +268,6 @@ class NotionSink:
             page_id = page["id"]
         self.db.kv_set(KV_SERVICE_PAGE, page_id)
         return page_id
-
-    # --- one-off: the log of the previous version (all decisions + «Важливе» checkbox, database on the main page)
-    async def _migrate_to_v3(self, log_ds: str) -> None:
-        database_id = self.db.kv_get(KV_LOG_DATABASE)
-        ids = json.loads(self.db.kv_get(KV_LOG_PROP_IDS) or "{}")
-        if "Важливе" in ids:
-            await self._throttle()
-            props = (await self.client.data_sources.retrieve(log_ds))["properties"]
-            by_id = {p["id"]: name for name, p in props.items()}
-            important, kind, key = by_id.get(ids["Важливе"]), by_id.get(ids["Тип"]), by_id.get(ids["Key"])
-            while important and kind and key:  # routine decisions leave the log (they stay on the day pages)
-                await self._throttle()
-                result = await self.client.data_sources.query(log_ds, page_size=100, filter={"and": [
-                    {"property": important, "checkbox": {"equals": False}},
-                    {"property": kind, "select": {"equals": LOG_TYPES["decision"]}},
-                    {"property": key, "rich_text": {"is_not_empty": True}},
-                ]})
-                for page in result.get("results", []):
-                    await self._throttle()
-                    await self.client.pages.update(page["id"], in_trash=True)
-                if not result.get("has_more"):
-                    break
-            view_ids = {name: unquote(pid) for name, pid in ids.items() if name != "Важливе"}
-            await self._throttle()
-            listing = await self.views_client.request(path=f"views?database_id={database_id}", method="GET")
-            specs = {s["name"]: s for s in log_views(view_ids)}
-            for ref in listing.get("results", []):
-                await self._throttle()
-                view = await self.views_client.request(path=f"views/{ref['id']}", method="GET")
-                await self._throttle()
-                if view.get("name") in specs:
-                    body = {"filter": None} | view_body(specs[view["name"]])
-                    body.pop("type")
-                    await self.views_client.request(path=f"views/{view['id']}", method="PATCH", body=body)
-                elif view.get("name") == "🗂 Усі записи":
-                    await self.views_client.request(path=f"views/{view['id']}", method="DELETE")
-            for row in self.db.conn.execute("SELECT key, value FROM kv WHERE key LIKE 'project_views:%'").fetchall():
-                page_id, stored = row["key"].partition(":")[2], json.loads(row["value"])
-                for spec in log_views(view_ids, page_id):
-                    if spec["key"] in stored:
-                        body = view_body(spec)
-                        body.pop("type")
-                        await self._throttle()
-                        await self.views_client.request(path=f"views/{stored[spec['key']]['id']}", method="PATCH", body=body)
-            if important:
-                await self._throttle()
-                await self.client.data_sources.update(log_ds, properties={important: None})
-            ids.pop("Важливе")
-            self.db.kv_set(KV_LOG_PROP_IDS, json.dumps(ids, ensure_ascii=False))
-        await self._throttle()
-        parent = (await self.client.databases.retrieve(database_id)).get("parent") or {}
-        service = await self._service_page()
-        if (parent.get("page_id") or "").replace("-", "") == self.parent_page_id.replace("-", ""):
-            await self._throttle()
-            await self.client.databases.update(database_id, parent={"type": "page_id", "page_id": service})
 
     async def load_projects(self) -> list[dict[str, Any]]:
         """Projects as the user sees them in Notion (their «Чати» column is the chat → project mapping)."""
