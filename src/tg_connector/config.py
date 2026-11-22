@@ -79,6 +79,13 @@ class Settings:
     max_chars_per_llm_call: int
     batch_size: int
     lock_ttl_seconds: int
+    # Team bot (optional, beyond the test task): token from @BotFather.
+    tg_bot_token: str | None = None
+    # Cloud (Railway): the Telegram session comes from a variable instead of a file; the worker waits
+    # for the uploaded database instead of starting from zero; raw texts are kept only N days (0 = forever).
+    tg_session: str | None = None
+    wait_for_state: bool = False
+    raw_retention_days: int = 0
 
     @property
     def db_path(self) -> Path:
@@ -89,17 +96,26 @@ class Settings:
         return self.data_dir / "telegram.session"
 
     @property
+    def cloud_session_path(self) -> Path:
+        return self.data_dir / "cloud.session"
+
+    @property
+    def bot_session_path(self) -> Path:
+        return self.data_dir / "bot.session"
+
+    @property
     def log_path(self) -> Path:
         return self.data_dir / "logs" / "connector.log"
 
     def secret_values(self) -> list[str]:
         """Values that must never appear in logs or tool output."""
-        values = [self.tg_api_hash, self.gemini_api_key, self.notion_token]
-        if self.session_path.exists():
-            try:
-                values.append(self.session_path.read_text().strip())
-            except OSError:
-                pass
+        values = [self.tg_api_hash, self.gemini_api_key, self.notion_token, self.tg_bot_token, self.tg_session]
+        for path in (self.session_path, self.bot_session_path, self.cloud_session_path):
+            if path.exists():
+                try:
+                    values.append(path.read_text().strip())
+                except OSError:
+                    pass
         return [v for v in values if v and len(v) >= 6]
 
 
@@ -130,4 +146,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
         max_chars_per_llm_call=_env_int("MAX_CHARS_PER_LLM_CALL", 60_000),
         batch_size=_env_int("SYNC_BATCH_SIZE", 200),
         lock_ttl_seconds=_env_int("LOCK_TTL_SECONDS", 900),
+        tg_bot_token=_env("TG_BOT_TOKEN"),
+        tg_session=_env("TG_SESSION"),
+        wait_for_state=_env_bool("WAIT_FOR_STATE", False),
+        raw_retention_days=_env_int("RAW_RETENTION_DAYS", 0),
     )

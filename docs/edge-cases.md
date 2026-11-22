@@ -32,6 +32,29 @@
 | **Метрики та цифри** (виручка, CPI, CTR, бюджети) | окремий розділ самарі «Ключові факти й цифри», числа копіюються точно | eval `exact_numbers` |
 | **Голосові та відеокружки** | не розшифровуються, і модель не вигадує їхній зміст. Під самарі є лічильник «без розшифровки: N». День лише з голосовими все одно зʼявляється в Notion | `test_voice_only_day_is_not_silently_dropped`, `test_new_voice_note_updates_counter_without_llm_call` + eval `voice_notes` |
 
+## B2. Notion і командний бот
+
+| Ситуація | Що робить конектор | Перевірка |
+|---|---|---|
+| Користувач **перейменував** колонку в Notion (вживу: «Чат» → «Категорія») | колонки впізнаються за внутрішнім id властивості: синхронізація заповнює колонку під новою назвою, дубль не створюється | `test_renamed_column_is_followed_not_recreated`, `test_rename_is_followed_even_for_installs_without_stored_ids` |
+| Користувач **видалив** колонку конектора або **додав свою** | видалену колонку конектор повертає, а свої колонки користувача не чіпає | `test_deleted_column_is_added_back_and_own_columns_are_untouched` |
+| Користувач позначив задачу «Готово» | стан задачі належить користувачу: синхронізація його не перезаписує, бот таку задачу не показує | `test_user_task_state_is_never_overwritten`, `test_tasks_ticked_done_in_notion_are_not_shown` |
+| Команди `/status` і **відповіді бота** в групі | шум: не потрапляють у самарі, тож немає «самарі із самарі». Повідомлення інших ботів лишаються | `test_bot_commands_and_our_bot_replies_never_reach_the_llm` + живий прогін (11 повідомлень, 0 LLM-викликів) |
+| `/status` у чаті A | лише дані чату A, ніколи інших чатів | `test_no_data_from_another_chat_ever` |
+| Бот у невідстежуваній групі / в особистих повідомленнях | виходить із групи мовчки / відповідає лише довідкою | `test_untracked_group_gets_nothing_and_the_bot_leaves`, `test_private_messages_get_help_but_no_project_data` |
+| Старе відкрите питання, вирішене наступного дня | бот показує питання лише з останнього дня із самарі | `test_old_open_questions_are_not_shown_once_a_newer_day_exists` |
+| Notion недоступний під час `/status` | задачі беруться з локальних самарі, про це сказано у відповіді | `test_notion_down_falls_back_to_tasks_from_summaries` |
+
+## B3. Хмара (Railway)
+
+| Ситуація | Що робить конектор | Перевірка |
+|---|---|---|
+| Перший старт у хмарі, база ще не завантажена | сервіс **чекає** на файл бази (`WAIT_FOR_STATE=true`), а не стартує з нуля: інакше створив би в Notion **другі** бази й переробив історію | `test_worker_waits_for_the_uploaded_database_instead_of_starting_from_zero` |
+| Файл бази ще завантажується або пошкоджений | запуск лише коли файл перестав рости і SQLite підтверджує його цілісність (`PRAGMA quick_check`) | `test_database_ready_rejects_missing_empty_and_garbage_files` |
+| Перенесення стану | `tg-connector snapshot` робить узгоджену копію бази (вона працює в режимі WAL) | `test_snapshot_is_a_consistent_copy_with_the_state` |
+| Сесія Telegram у хмарі | береться зі змінної `TG_SESSION`, а не з файлу; це **окрема** сесія (`login --cloud`), локальна не зачіпається; значення маскується в логах | `test_hosted_worker_takes_the_session_from_a_variable_not_a_file`, `test_cloud_login_creates_a_separate_session_file_and_keeps_the_local_one` |
+| Сирий текст переписки в хмарі | `RAW_RETENTION_DAYS=14`: повідомлення днів, які вже завершені й самаризовані, видаляються через 14 днів; самарі лишаються, синхронізація лишається інкрементальною | `test_old_raw_texts_are_purged_after_their_day_is_final_and_summarized` |
+
 ## C. Зміст діалогів (eval на справжній моделі)
 
 `uv run python evals/run_eval.py`: 17 змодельованих діалогів, кожен з автоматичними перевірками змісту самарі.

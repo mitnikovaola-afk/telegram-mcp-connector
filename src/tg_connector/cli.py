@@ -8,6 +8,7 @@
     uv run tg-connector status           # cursors, pending work, recent runs
     uv run tg-connector summaries        # print stored summaries
     uv run tg-connector serve            # MCP server over stdio (used by Claude Desktop / Claude Code)
+    uv run tg-connector bot              # team bot for group chats: /status, /tasks (--sync: + periodic sync)
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from typing import Any
 
@@ -54,6 +56,11 @@ def _print_report(report: dict[str, Any]) -> None:
         print(f"Notion   : skipped — {n['skipped']}")
     elif n:
         print(f"Notion   : created={n['created']} updated={n['updated']} skipped_empty={n['skipped_empty']} failed={n['failed']}")
+        if any(n.get(k) for k in ("tasks_created", "tasks_updated", "tasks_removed")):
+            print(
+                f"           tasks: created={n.get('tasks_created', 0)} updated={n.get('tasks_updated', 0)} "
+                f"removed={n.get('tasks_removed', 0)}"
+            )
     for section in ("sync", "summaries", "notion"):
         for err in report.get(section, {}).get("errors", []) if isinstance(report.get(section), dict) else []:
             print(f"  ! {section}: {err}")
@@ -65,8 +72,37 @@ async def _cmd_login(args: argparse.Namespace) -> int:
     from .telegram_source import TelethonSource
 
     settings = load_settings()
-    name = await TelethonSource(settings).login_interactive()
-    print(f"Logged in to Telegram as {name}. Session saved to {settings.session_path} (keep it private).")
+    name = await TelethonSource(settings).login_interactive(cloud=args.cloud)
+    if args.cloud:
+        print(
+            f"Logged in to Telegram as {name} — a SEPARATE session for the cloud (a new device in Telegram → Devices).\n"
+            f"Saved to {settings.cloud_session_path} (chmod 600, not printed).\n"
+            f"Next: pbcopy < {settings.cloud_session_path}  → paste into the Railway sealed variable TG_SESSION →  "
+            f"rm {settings.cloud_session_path}"
+        )
+    else:
+        print(f"Logged in to Telegram as {name}. Session saved to {settings.session_path} (keep it private).")
+    return 0
+
+
+async def _cmd_snapshot(args: argparse.Namespace) -> int:
+    """A consistent copy of the local database to move the state to a hosted worker."""
+    from pathlib import Path
+
+    from .db import Database
+
+    settings = load_settings()
+    target = Path(args.path)
+    if target.exists():
+        print(f"{target} already exists — choose another path or delete it first.")
+        return 1
+    db = Database(settings.db_path)
+    db.snapshot(str(target))
+    os.chmod(target, 0o600)
+    tracked = len(db.tracked_chats())
+    db.close()
+    print(f"Snapshot written to {target} ({target.stat().st_size} bytes, chmod 600): {tracked} tracked chat(s).")
+    print("It contains chat messages — upload it only to your own volume and delete it afterwards.")
     return 0
 
 
@@ -192,7 +228,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tg-connector", description="Telegram → daily summaries MCP connector")
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("login", help="log in to Telegram (interactive)")
+    p = sub.add_parser("login", help="log in to Telegram (interactive)")
+    p.add_argument("--cloud", action="store_true", help="separate session for a hosted worker (Railway)")
     sub.add_parser("check", help="verify Telegram / Gemini / Notion configuration")
     p = sub.add_parser("chats", help="list chats with ids")
     p.add_argument("-q", "--query")
@@ -214,6 +251,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--to", dest="date_to")
     p.add_argument("-n", "--limit", type=int, default=20)
     sub.add_parser("serve", help="run the MCP server over stdio")
+    p = sub.add_parser("snapshot", help="consistent copy of the local database (to move the state to Railway)")
+    p.add_argument("path")
+    p = sub.add_parser("bot", help="run the team bot (/status, /tasks) for tracked group chats")
+    p.add_argument("--sync", action="store_true",
+                   help="also run the periodic sync in this process (for 24/7 hosting)")
     args = parser.parse_args(argv)
 
     settings = load_settings()
@@ -225,6 +267,15 @@ def main(argv: list[str] | None = None) -> None:
         create_server(settings).run("stdio")
         return
 
+    if args.command == "bot":
+        from .bot import run_bot
+
+        try:
+            asyncio.run(run_bot(settings, with_sync=args.sync))
+        except KeyboardInterrupt:
+            pass
+        return
+
     handlers = {
         "login": _cmd_login,
         "check": _cmd_check,
@@ -234,5 +285,6 @@ def main(argv: list[str] | None = None) -> None:
         "sync": _cmd_sync,
         "status": _cmd_status,
         "summaries": _cmd_summaries,
+        "snapshot": _cmd_snapshot,
     }
     sys.exit(asyncio.run(handlers[args.command](args)))

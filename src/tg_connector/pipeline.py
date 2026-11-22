@@ -13,7 +13,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from .config import Settings
@@ -85,6 +85,10 @@ class Pipeline:
                     report["notion"] = {"skipped": "NOTION_TOKEN / NOTION_PARENT_PAGE_ID are not set"}
                 else:
                     report["notion"] = await self.sink.export_pending()
+
+            if self.settings.raw_retention_days > 0:
+                cutoff = (now.astimezone(self.settings.timezone).date() - timedelta(days=self.settings.raw_retention_days))
+                report["retention"] = {"deleted_messages": self.db.purge_old_messages(cutoff.isoformat())}
 
             if any(isinstance(v, dict) and v.get("errors") for v in report.values()):
                 report["status"] = "partial"

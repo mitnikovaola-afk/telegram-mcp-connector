@@ -126,57 +126,141 @@ class FakeLLM:
 
 
 class FakeNotion:
-    """Minimal in-memory imitation of the notion_client.AsyncClient surface we use."""
+    """In-memory imitation of the notion_client.AsyncClient surface we use: two databases (days, tasks),
+    data sources, pages, blocks and the Views API. `pages` holds the day pages, `tasks` the task pages."""
 
     def __init__(self) -> None:
-        self.pages: dict[str, dict] = {}
-        self.created = 0
+        self.databases_created: list[dict] = []
+        self.data_sources: dict[str, dict] = {}  # ds id -> {"properties": {...}}
+        self.store: dict[str, dict] = {}  # every page: {"ds", "key", "props", "children", "in_trash"}
+        self.views: dict[str, dict] = {}  # view id -> view (with "database_id")
+        self.fail_queries: Exception | None = None
+        self.created = 0  # day pages only
         self.updated = 0
         self._next = 0
 
-        async def db_create(**kw):
-            return {"id": "db-1", "url": "https://notion.so/db-1", "data_sources": [{"id": "ds-1"}]}
+        async def db_create(parent, title, initial_data_source, icon=None, **kw):
+            n = len(self.databases_created) + 1
+            db_id, ds_id = f"db-{n}", f"ds-{n}"
+            props = {name: {"id": f"p{n}-{i}", "type": next(iter(spec))} for i, (name, spec) in enumerate(initial_data_source["properties"].items())}
+            self.data_sources[ds_id] = {"properties": props}
+            self.databases_created.append({"id": db_id, "title": title[0]["text"]["content"], "ds": ds_id})
+            self.views[f"view-{db_id}-default"] = {"id": f"view-{db_id}-default", "name": "Default view", "database_id": db_id}
+            if n == 2:  # the tasks database relates to the days one: Notion adds the synced property there
+                self.data_sources["ds-1"]["properties"]["Задачі"] = {"id": "p1-rel", "type": "relation"}
+            return {"id": db_id, "url": f"https://notion.so/{db_id}", "data_sources": [{"id": ds_id}]}
 
-        async def ds_query(data_source_id, filter, page_size=1):
-            key = filter["rich_text"]["equals"]
-            hits = [{"id": pid} for pid, p in self.pages.items() if p["key"] == key]
+        async def db_update(database_id, **kw):
+            return {"id": database_id}
+
+        async def ds_retrieve(data_source_id):
+            return {"id": data_source_id, "properties": dict(self.data_sources[data_source_id]["properties"])}
+
+        async def ds_update(data_source_id, properties):
+            props = self.data_sources[data_source_id]["properties"]
+            for i, (name, spec) in enumerate(properties.items()):
+                props[name] = {"id": f"added-{i}", "type": next(iter(spec))}
+            return {"id": data_source_id}
+
+        def matches(page: dict, flt: dict) -> bool:
+            if "and" in flt:
+                return all(matches(page, f) for f in flt["and"])
+            prop = page["props"].get(flt["property"]) or {}
+            if "rich_text" in flt:
+                value = "".join(t["text"]["content"] for t in prop.get("rich_text", []))
+                return value == flt["rich_text"]["equals"]
+            name = (prop.get("select") or {}).get("name")
+            cond = flt["select"]
+            return name == cond["equals"] if "equals" in cond else name != cond["does_not_equal"]
+
+        async def ds_query(data_source_id, filter, page_size=1, sorts=None):
+            if self.fail_queries:
+                raise self.fail_queries
+            hits = [
+                {"id": pid, "properties": p["props"], "url": f"https://notion.so/{pid}"}
+                for pid, p in self.store.items()
+                if p["ds"] == data_source_id and not p["in_trash"] and matches(p, filter)
+            ]
             return {"results": hits[:page_size]}
 
-        async def page_create(parent, properties, children):
+        async def page_create(parent, properties, children=(), icon=None):
             self._next += 1
             pid = f"page-{self._next}"
             key = properties["Key"]["rich_text"][0]["text"]["content"]
-            self.pages[pid] = {"key": key, "props": properties, "children": list(children)}
-            self.created += 1
+            ds = parent["data_source_id"]
+            self.store[pid] = {"ds": ds, "key": key, "props": properties, "children": list(children), "icon": icon, "in_trash": False}
+            if ds == "ds-1":
+                self.created += 1
             return {"id": pid}
 
-        async def page_update(page_id, properties):
-            self.pages[page_id]["props"] = properties
-            self.updated += 1
+        async def page_update(page_id, properties=None, icon=None, in_trash=None):
+            page = self.store[page_id]
+            if properties:
+                page["props"] = {**page["props"], **properties}
+            if icon:
+                page["icon"] = icon
+            if in_trash is not None:
+                page["in_trash"] = in_trash
+            if page["ds"] == "ds-1" and properties:
+                self.updated += 1
             return {"id": page_id}
 
         async def page_retrieve(page_id):
-            return {"id": page_id, "url": f"https://notion.so/{page_id}"}
+            if page_id not in self.store:
+                return {"id": page_id, "url": f"https://notion.so/{page_id}"}
+            page = self.store[page_id]
+            return {"id": page_id, "properties": page["props"], "in_trash": page["in_trash"], "url": f"https://notion.so/{page_id}"}
 
         async def children_list(page_id, start_cursor=None):
-            return {"results": [{"id": f"{page_id}-b{i}"} for i, _ in enumerate(self.pages[page_id]["children"])], "has_more": False}
+            return {"results": [{"id": f"{page_id}-b{i}"} for i, _ in enumerate(self.store[page_id]["children"])], "has_more": False}
 
         async def block_delete(block_id):
             page_id = block_id.rsplit("-b", 1)[0]
-            if self.pages[page_id]["children"]:
-                self.pages[page_id]["children"].pop()
+            if self.store[page_id]["children"]:
+                self.store[page_id]["children"].pop()
 
         async def children_append(page_id, children):
-            self.pages[page_id]["children"].extend(children)
+            self.store[page_id]["children"].extend(children)
 
-        self.databases = SimpleNamespace(create=db_create)
-        self.data_sources = SimpleNamespace(query=ds_query)
+        async def request(path, method, body=None, **kw):
+            if method == "GET" and path.startswith("views?database_id="):
+                db_id = path.split("=", 1)[1]
+                return {"results": [{"id": v["id"]} for v in self.views.values() if v["database_id"] == db_id]}
+            if method == "GET" and path.startswith("views/"):
+                return self.views[path.split("/", 1)[1]]
+            if method == "PATCH" and path.startswith("views/"):
+                self.views[path.split("/", 1)[1]].update(body)
+                return self.views[path.split("/", 1)[1]]
+            if method == "POST" and path == "views":
+                vid = f"view-{len(self.views) + 1}"
+                self.views[vid] = {"id": vid, **body}
+                return self.views[vid]
+            raise AssertionError(f"unexpected request {method} {path}")
+
+        self.databases = SimpleNamespace(create=db_create, update=db_update)
+        self.data_sources_api = SimpleNamespace(retrieve=ds_retrieve, update=ds_update, query=ds_query)
         self.pages_api = SimpleNamespace(create=page_create, update=page_update, retrieve=page_retrieve)
         self.blocks = SimpleNamespace(delete=block_delete, children=SimpleNamespace(list=children_list, append=children_append))
+        self.request = request
 
-    # NotionSink accesses `client.pages`, keep `self.pages` as the storage dict.
+    @property
+    def pages(self) -> dict[str, dict]:
+        """Day pages (live, not trashed)."""
+        return {pid: p for pid, p in self.store.items() if p["ds"] == "ds-1" and not p["in_trash"]}
+
+    @property
+    def tasks(self) -> dict[str, dict]:
+        """Task pages (live, not trashed)."""
+        return {pid: p for pid, p in self.store.items() if p["ds"] == "ds-2" and not p["in_trash"]}
+
+    def view_names(self, db_id: str) -> list[str]:
+        return [v["name"] for v in self.views.values() if v["database_id"] == db_id]
+
     def as_client(self) -> SimpleNamespace:
-        return SimpleNamespace(databases=self.databases, data_sources=self.data_sources, pages=self.pages_api, blocks=self.blocks)
+        return SimpleNamespace(
+            databases=self.databases, data_sources=self.data_sources_api, pages=self.pages_api,
+            blocks=self.blocks, request=self.request,
+        )
 
 
 def make_settings(tmp_path: Path, **overrides) -> Settings:
@@ -200,6 +284,7 @@ class Env:
         self.notion = FakeNotion()
         self.sink = NotionSink("token", "0" * 32, self.db)
         self.sink.client = self.notion.as_client()
+        self.sink.views_client = self.sink.client
         self.now = NOW
         self.pipeline = Pipeline(self.settings, self.db, self.source, self.llm, self.sink, clock=lambda: self.now)
 

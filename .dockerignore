@@ -1,0 +1,18 @@
+# Never ship secrets or local data into an image
+.env
+.env.*
+!.env.example
+data/
+*.session
+private/
+CLAUDE.local.md
+
+# Not needed at runtime
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+evals/
+docs/

@@ -101,6 +101,14 @@ CREATE TABLE IF NOT EXISTS locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS notion_tasks (
+    chat_id    INTEGER NOT NULL,
+    local_date TEXT    NOT NULL,
+    task_key   TEXT    NOT NULL,      -- chat_id:date:hash(task, owner)
+    page_id    TEXT    NOT NULL,
+    PRIMARY KEY (chat_id, local_date, task_key)
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -301,6 +309,24 @@ class Database:
         )
         return {r["message_id"]: r for r in rows}
 
+    def purge_old_messages(self, before_date: str) -> int:
+        """Data minimization for hosted installs: drop raw messages of days that are finished AND summarized.
+        Summaries stay; the cursor keeps the sync incremental; edits older than the edit window are
+        not tracked anyway, so nothing that the pipeline still needs is removed."""
+        with self.tx() as c:
+            cur = c.execute(
+                """DELETE FROM messages WHERE local_date < ? AND EXISTS (
+                       SELECT 1 FROM days d JOIN summaries s ON s.chat_id = d.chat_id AND s.local_date = d.local_date
+                       WHERE d.chat_id = messages.chat_id AND d.local_date = messages.local_date
+                         AND d.summarized_rev >= d.rev AND s.is_final = 1)""",
+                (before_date,),
+            )
+            return cur.rowcount
+
+    def snapshot(self, target: str) -> None:
+        """A consistent single-file copy of the database (the live one runs in WAL mode)."""
+        self.conn.execute("VACUUM INTO ?", (target,))
+
     def recent_signal_texts(self, chat_id: int, limit: int = 200) -> list[str]:
         rows = self.conn.execute(
             "SELECT text FROM messages WHERE chat_id = ? AND is_noise = 0 ORDER BY message_id DESC LIMIT ?",
@@ -461,6 +487,27 @@ class Database:
             c.execute(
                 "UPDATE summaries SET notion_page_id = ?, notion_synced_hash = ? WHERE chat_id = ? AND local_date = ?",
                 (page_id, synced_hash, chat_id, local_date),
+            )
+
+    def notion_tasks_for_day(self, chat_id: int, local_date: str) -> dict[str, str]:
+        rows = self.conn.execute(
+            "SELECT task_key, page_id FROM notion_tasks WHERE chat_id = ? AND local_date = ?", (chat_id, local_date)
+        )
+        return {r["task_key"]: r["page_id"] for r in rows}
+
+    def save_notion_task(self, chat_id: int, local_date: str, task_key: str, page_id: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO notion_tasks (chat_id, local_date, task_key, page_id) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(chat_id, local_date, task_key) DO UPDATE SET page_id = excluded.page_id""",
+                (chat_id, local_date, task_key, page_id),
+            )
+
+    def forget_notion_task(self, chat_id: int, local_date: str, task_key: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "DELETE FROM notion_tasks WHERE chat_id = ? AND local_date = ? AND task_key = ?",
+                (chat_id, local_date, task_key),
             )
 
     # ------------------------------------------------------------------- runs

@@ -41,7 +41,10 @@ async def test_rerun_creates_no_duplicates_and_calls_nothing(env):
     assert second["sync"]["fetched"] == 0
     assert second["sync"]["inserted"] == 0
     assert second["summaries"]["llm_calls"] == 0
-    assert second["notion"] == {"created": 0, "updated": 0, "skipped_empty": 0, "failed": 0, "errors": []}
+    assert second["notion"] == {
+        "created": 0, "updated": 0, "skipped_empty": 0, "failed": 0,
+        "tasks_created": 0, "tasks_updated": 0, "tasks_removed": 0, "errors": [],
+    }
 
     assert env.db.count_messages() == 7
     assert len(env.notion.pages) == 3

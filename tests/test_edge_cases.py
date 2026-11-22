@@ -20,10 +20,21 @@ def all_prompts(env) -> str:
 
 
 def blocks_text(page: dict) -> str:
-    parts = []
-    for block in page["children"]:
-        body = block[block["type"]]
-        parts += [t["text"]["content"] for t in body.get("rich_text", [])]
+    """All text of a page, including blocks nested in columns; page mentions show as @<page id>."""
+    parts: list[str] = []
+
+    def walk(blocks: list[dict]) -> None:
+        for block in blocks:
+            body = block[block["type"]]
+            line = "".join(
+                f"@{t['mention']['page']['id']}" if t["type"] == "mention" else t["text"]["content"]
+                for t in body.get("rich_text", [])
+            )
+            if line:
+                parts.append(line)
+            walk(body.get("children", []))
+
+    walk(page["children"])
     return "\n".join(parts)
 
 
@@ -309,8 +320,8 @@ def test_notion_page_has_full_content_with_and_without_voice_notes():
         data = dict(summary, **({"not_transcribed": voice} if voice else {}))
         page = {"children": build_blocks(dict(base, summary_json=json.dumps(data, ensure_ascii=False)))}
         text = blocks_text(page)
-        for expected in ("Креатив A лишається", "Марія: Звіт для клієнта — термін: вівторок, 24.11",
-                         "Ключові факти й цифри", "CPI $1.40", "Рішення", "https://example.com/doc"):
+        for expected in ("Креатив A лишається", "Звіт для клієнта · Марія · 📅 вівторок, 24.11",
+                         "📊 Ключові факти й цифри", "CPI $1.40", "🎯 Рішення", "https://example.com/doc"):
             assert expected in text, (voice, expected)
         assert ("без розшифровки: 2" in text) == bool(voice)
 
@@ -335,3 +346,22 @@ async def test_layout_change_rerenders_pages_once(env, monkeypatch):
 
     assert first["notion"]["updated"] == 1 and env.llm.calls == 1  # re-rendered without any LLM call
     assert second["notion"]["updated"] == 0
+
+
+async def test_bot_commands_and_our_bot_replies_never_reach_the_llm(env):
+    """/status in a group and the team bot's answer must not be summarized again (it would echo old decisions)."""
+    env.track(GROUP, "Маркетинг")
+    env.db.kv_set("team_bot_id", "777")
+    env.source.add(GROUP, 1, "Запускаємо креатив B у пʼятницю", at(20, 10))
+    env.source.add(GROUP, 2, "/status", at(20, 10, 1))
+    env.source.add(GROUP, 3, "/tasks@holywatertest_bot", at(20, 10, 2))
+    env.source.add(GROUP, 4, "📊 Статус: Маркетинг ✅ Рішення • 19.11 — Бюджет $500 погоджено", at(20, 10, 2), sender="TeamBot")
+    msg = env.source.messages[GROUP][4]
+    env.source.messages[GROUP][4] = type(msg)(**{**msg.__dict__, "sender_id": 777})
+    env.source.add(GROUP, 5, "Деплой 2.5 пройшов успішно", at(20, 10, 3), sender="CI Bot")  # another bot: kept
+
+    await env.run()
+
+    prompt = env.llm.prompts[-1]
+    assert "Запускаємо креатив B" in prompt and "Деплой 2.5" in prompt
+    assert "/status" not in prompt and "/tasks" not in prompt and "Бюджет $500" not in prompt

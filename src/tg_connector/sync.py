@@ -54,13 +54,14 @@ async def sync_chat(
     chat = db.get_chat(chat_id)
     start_cursor = int(chat["cursor_message_id"]) if chat else 0
     floor = int(chat["floor_message_id"]) if chat else 0
+    ignore = team_bot_ids(db)
     since = None if start_cursor > 0 else backfill_start(now, settings)
     stats: dict[str, Any] = {"fetched": 0, "inserted": 0, "updated": 0, "deleted": 0, "dirty_days": set()}
 
     async for batch in source.iter_new_messages(chat_id, start_cursor, since, settings.batch_size):
         if not batch:
             continue
-        prepared = [prepare(m, settings.timezone) for m in batch]
+        prepared = [prepare(m, settings.timezone, ignore) for m in batch]
         result = db.store_batch(chat_id, prepared, new_cursor=max(m.message_id for m in batch))
         for m in batch:
             if m.migrated_to:
@@ -76,7 +77,7 @@ async def sync_chat(
         recent = await source.messages_in_window(chat_id, window_start, start_cursor, min_id=floor)
         recent = [m for m in recent if m.message_id > floor]  # never touch history skipped by "track from now"
         if recent:
-            result = db.store_batch(chat_id, [prepare(m, settings.timezone) for m in recent], new_cursor=None)
+            result = db.store_batch(chat_id, [prepare(m, settings.timezone, ignore) for m in recent], new_cursor=None)
             stats["updated"] += result.updated + result.inserted
             stats["dirty_days"] |= result.dirty_days
         # Stored in the same window but no longer returned by Telegram = deleted there.
@@ -88,6 +89,14 @@ async def sync_chat(
 
     db.mark_chat_synced(chat_id, error=None)
     return stats
+
+
+TEAM_BOT_KEY = "team_bot_id"
+
+
+def team_bot_ids(db: Database) -> frozenset[int]:
+    raw = db.kv_get(TEAM_BOT_KEY)
+    return frozenset({int(raw)}) if raw else frozenset()
 
 
 def backfill_start(now: datetime, settings: Settings) -> datetime:

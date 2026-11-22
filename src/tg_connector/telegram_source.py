@@ -16,6 +16,7 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone, tzinfo
+from pathlib import Path
 
 from telethon import TelegramClient, errors, types, utils
 from telethon.sessions import StringSession
@@ -139,7 +140,7 @@ class TelethonSource:
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------- session
-    def _new_client(self, session: str) -> TelegramClient:
+    def _new_client(self, session: str, device_model: str = "tg-mcp-connector") -> TelegramClient:
         if not (self.settings.tg_api_id and self.settings.tg_api_hash):
             raise NotAuthorized("TG_API_ID / TG_API_HASH are not set in .env")
         return TelegramClient(
@@ -148,24 +149,28 @@ class TelethonSource:
             self.settings.tg_api_hash,
             flood_sleep_threshold=60,
             receive_updates=False,
-            device_model="tg-mcp-connector",
+            device_model=device_model,
             app_version="0.1.0",
         )
 
-    def save_session(self, session: str) -> None:
-        path = self.settings.session_path
+    def save_session(self, session: str, path: Path | None = None) -> None:
+        path = path or self.settings.session_path
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(session)
         os.chmod(path, 0o600)
 
-    async def login_interactive(self) -> str:
-        """Prompts for phone, login code and (if enabled) 2FA password in the terminal."""
-        client = self._new_client("")
+    async def login_interactive(self, cloud: bool = False) -> str:
+        """Prompts for phone, login code and (if enabled) 2FA password in the terminal.
+
+        cloud=True creates a SEPARATE session (a new device in Telegram → Devices) for a hosted worker and
+        saves it to data/cloud.session without printing it; the local session is not touched. One session
+        must never run in two places at once: Telegram may revoke it (AUTH_KEY_DUPLICATED)."""
+        client = self._new_client("", device_model="tg-mcp-connector-cloud" if cloud else "tg-mcp-connector")
         await client.start()
         me = await client.get_me()
-        self.save_session(client.session.save())
+        self.save_session(client.session.save(), self.settings.cloud_session_path if cloud else None)
         await client.disconnect()
         return utils.get_display_name(me)
 
@@ -174,14 +179,17 @@ class TelethonSource:
             if self._client is not None and self._client.is_connected():
                 return self._client
             path = self.settings.session_path
-            session = path.read_text().strip() if path.exists() else ""
+            from_env = bool(self.settings.tg_session)  # hosted worker: the session is a (sealed) variable
+            session = self.settings.tg_session if from_env else (path.read_text().strip() if path.exists() else "")
             if not session:
                 raise NotAuthorized("Telegram is not logged in yet: run `uv run tg-connector login` in a terminal")
             client = self._new_client(session)
             await client.connect()
             if not await client.is_user_authorized():
                 await client.disconnect()
-                raise NotAuthorized("Telegram session is invalid or revoked: run `uv run tg-connector login` again")
+                hint = "create a new one with `tg-connector login --cloud` and update TG_SESSION" if from_env else \
+                    "run `uv run tg-connector login` again"
+                raise NotAuthorized(f"Telegram session is invalid or revoked: {hint}")
             self._client = client
             return client
 

@@ -27,6 +27,8 @@ THANKS_AND_LAUGHS = {
     "лол", "lol", "кек", "хах", "хаха", "хахаха", "ахах", "ахаха", "ахахах", "haha", "hahaha", "rofl", "lmao",
 }
 _TRAILING = re.compile(r"[\s.!?,…)(:;]+$")
+# "/status", "/tasks@some_bot": commands to bots, not conversation.
+_BOT_COMMAND = re.compile(r"^/[A-Za-z0-9_]+(@\w+)?(\s|$)")
 URL_RE = re.compile(r"https?://[^\s<>()\"'«»]+")
 
 
@@ -40,6 +42,8 @@ def is_noise(m: RawMessage) -> bool:
     text = m.text.strip()
     if not text:
         return True  # media without caption (CAPTION_ONLY_KINDS), empty message
+    if _BOT_COMMAND.match(text):
+        return True
     if text in AGREEMENT_MARKS:
         return False
     if not any(ch.isalnum() for ch in text):
@@ -54,11 +58,13 @@ def content_hash(m: RawMessage) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def prepare(m: RawMessage, tz: ZoneInfo) -> PreparedMessage:
+def prepare(m: RawMessage, tz: ZoneInfo, ignore_senders: frozenset[int] = frozenset()) -> PreparedMessage:
+    """ignore_senders: our own team bot — its /status replies retell earlier summaries, and summarizing
+    them again would echo old decisions into new days (a loop). Other bots (CI, reminders) stay."""
     return PreparedMessage(
         raw=m,
         local_date=m.sent_at.astimezone(tz).date().isoformat(),
-        is_noise=is_noise(m),
+        is_noise=is_noise(m) or (m.sender_id is not None and m.sender_id in ignore_senders),
         content_hash=content_hash(m),
     )
 
