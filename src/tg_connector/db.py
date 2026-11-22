@@ -126,6 +126,18 @@ CREATE TABLE IF NOT EXISTS project_briefs (
     updated_at      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_page_id TEXT NOT NULL,
+    entry_key       TEXT NOT NULL,       -- type:date:hash(title) · analytics:date:metric · decision:<decision key>
+    entry_json      TEXT NOT NULL,       -- what should stand in Notion
+    written_json    TEXT,                -- what the connector wrote last (Notion differs = the user's edit)
+    page_id         TEXT,
+    state           TEXT NOT NULL DEFAULT 'dirty',   -- dirty | synced | dismissed (the user removed the row)
+    created_on      TEXT NOT NULL,
+    UNIQUE (project_page_id, entry_key)
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -560,19 +572,25 @@ class Database:
                 (chat_id, local_date, key),
             )
 
-    def count_notion_decisions(self, chat_ids: set[int]) -> int:
-        if not chat_ids:
-            return 0
-        ids = sorted(chat_ids)
-        return self.conn.execute(
-            f"SELECT count(*) FROM notion_decisions WHERE chat_id IN ({','.join('?' * len(ids))})", ids
-        ).fetchone()[0]
+    def notion_decision_page(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT page_id FROM notion_decisions WHERE decision_key = ?", (key,)).fetchone()
+        return row["page_id"] if row else None
 
     def get_project_brief(self, page_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM project_briefs WHERE project_page_id = ?", (page_id,)).fetchone()
 
-    def save_project_brief(self, page_id: str, brief: dict[str, Any], updated_on: str, input_hash: str, model: str) -> None:
+    def save_project_brief(self, page_id: str, brief: dict[str, Any], updated_on: str, input_hash: str, model: str,
+                           log: dict[str, dict[str, Any]] | None = None) -> None:
+        """The passport and its new/changed log entries ({entry_key: entry}) in ONE transaction."""
         with self.tx() as c:
+            for key, entry in (log or {}).items():
+                c.execute(
+                    """INSERT INTO project_log (project_page_id, entry_key, entry_json, created_on) VALUES (?, ?, ?, ?)
+                       ON CONFLICT(project_page_id, entry_key) DO UPDATE
+                           SET entry_json = excluded.entry_json, state = 'dirty'
+                           WHERE state != 'dismissed' AND entry_json != excluded.entry_json""",
+                    (page_id, key, json.dumps(entry, ensure_ascii=False, sort_keys=True), updated_on),
+                )
             c.execute(
                 """INSERT INTO project_briefs (project_page_id, brief_json, updated_on, input_hash, model, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?)
@@ -586,6 +604,26 @@ class Database:
         """Nothing new in the project's chats today: remember that the day was checked (no LLM call)."""
         with self.tx() as c:
             c.execute("UPDATE project_briefs SET updated_on = ? WHERE project_page_id = ?", (updated_on, page_id))
+
+    def project_log(self, project_page_id: str, state: str | None = None) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM project_log WHERE project_page_id = ? AND (? IS NULL OR state = ?) ORDER BY id",
+            (project_page_id, state, state),
+        ).fetchall()
+
+    def log_row_created(self, row_id: int, page_id: str) -> None:
+        """Remember the page before its values are confirmed: a crash here must not create a second row."""
+        with self.tx() as c:
+            c.execute("UPDATE project_log SET page_id = ? WHERE id = ?", (page_id, row_id))
+
+    def log_row_synced(self, row_id: int, page_id: str, written: dict[str, Any] | None) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE project_log SET page_id = ?, written_json = ?, state = 'synced' WHERE id = ?",
+                      (page_id, json.dumps(written, ensure_ascii=False) if written is not None else None, row_id))
+
+    def dismiss_log_row(self, row_id: int) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE project_log SET state = 'dismissed' WHERE id = ?", (row_id,))
 
     # ------------------------------------------------------------------- runs
     def start_run(self, trigger: str) -> int:

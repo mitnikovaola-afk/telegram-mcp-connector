@@ -65,7 +65,8 @@ def _print_report(report: dict[str, Any]) -> None:
     if "skipped" in b:
         print(f"Projects : skipped — {b['skipped']}")
     elif b:
-        print(f"Projects : briefs updated={b['updated']} unchanged={b['unchanged']} llm_calls={b['llm_calls']} failed={b['failed']}")
+        print(f"Projects : passports updated={b['updated']} unchanged={b['unchanged']} log_rows={b.get('log_rows', 0)} "
+              f"llm_calls={b['llm_calls']} failed={b['failed']}")
     for section in ("sync", "summaries", "notion", "projects"):
         for err in report.get(section, {}).get("errors", []) if isinstance(report.get(section), dict) else []:
             print(f"  ! {section}: {err}")

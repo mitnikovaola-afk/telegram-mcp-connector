@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import unquote
 
-from .notion_layout import TASK_DONE
+from .notion_layout import LOG_TYPES, TASK_DONE
 
 VIEWS_API_VERSION = "2026-03-11"
 DEFAULT_VIEW_NAME = "Default view"
@@ -148,7 +148,7 @@ async def ensure_views(client: Any, database_id: str, data_source_id: str, specs
         existing[view.get("name") or ""] = view["id"]
     done: list[str] = []
     for spec in specs:
-        body = {k: v for k, v in spec.items() if k != "default"}
+        body = view_body(spec)
         if spec["name"] in existing:
             continue
         if spec.get("default") and DEFAULT_VIEW_NAME in existing:
@@ -160,6 +160,7 @@ async def ensure_views(client: Any, database_id: str, data_source_id: str, specs
             await throttle()
             await client.request(path="views", method="POST", body={
                 "database_id": database_id, "data_source_id": data_source_id, **body,
+                **({"position": {"type": "start"}} if spec.get("default") else {}),
             })
         done.append(spec["name"])
     return done
@@ -171,33 +172,76 @@ def project_views(ids: dict[str, str]) -> list[dict[str, Any]]:
             "name": "📁 Проєкти",
             "type": "table",
             "default": True,
-            "sorts": [{"property": "Дата релізу", "direction": "ascending"}],
-            "quick_filters": {"Статус": {}},
+            "sorts": [{"property": ids["Дата релізу"], "direction": "ascending"}],
+            "quick_filters": {ids["Статус"]: {}},
             "configuration": {
                 "type": "table",
                 "wrap_cells": True,
-                "properties": _cols(
-                    ids,
-                    ["Проєкт", "Статус", "Дата релізу", "Відкритих задач", "Рішень", "Бриф оновлено", "Чати"],
-                    ["Key", "Задачі", "Рішення"],
-                ),
+                "properties": _cols(ids, ["Проєкт", "Статус", "Дата релізу", "Чати", "Оновлено"]),
             },
         },
     ]
 
 
-def decision_views(ids: dict[str, str]) -> list[dict[str, Any]]:
-    return [
+def _log_table(ids: dict[str, str], visible: list[str], **extra: Any) -> dict[str, Any]:
+    hidden = [name for name in ids if name not in visible]
+    return {"type": "table", "wrap_cells": True, "properties": _cols(ids, visible, hidden), **extra}
+
+
+def log_views(ids: dict[str, str], project_page_id: str | None = None) -> list[dict[str, Any]]:
+    """Views of the project log: in the log database itself, or (with a page id) the tabs of the linked table on
+    a project page. `ids`: our column name → property id, so renamed columns keep working."""
+    in_project = [{"property": ids["Проєкт"], "relation": {"contains": project_page_id}}] if project_page_id else []
+
+    def only(*conditions: dict[str, Any]) -> dict[str, Any]:
+        return {"and": [*in_project, *conditions]}
+
+    important = {"property": ids["Важливе"], "checkbox": {"equals": True}}
+    newest_first = [{"property": ids["Дата"], "direction": "descending"}]
+    specs: list[dict[str, Any]] = [
         {
-            "name": "🎯 Журнал рішень",
+            "key": "important",
+            "name": "📒 Важливе",
             "type": "table",
             "default": True,
-            "sorts": [{"property": "Дата", "direction": "descending"}],
-            "quick_filters": {"Проєкт": {}, "Чат": {}},
-            "configuration": {
-                "type": "table",
-                "wrap_cells": True,
-                "properties": _cols(ids, ["Рішення", "Дата", "Проєкт", "Чат"], ["Key"]),
-            },
+            "filter": only(important),
+            "sorts": newest_first,
+            "quick_filters": {ids["Тип"]: {}, ids["Ефект"]: {}},
+            "configuration": _log_table(ids, ["Запис", "Дата", "Тип", "Результат", "Ефект", "Висновок"]),
+        },
+        {
+            "key": "tests",
+            "name": "🧪 Тести",
+            "type": "table",
+            "filter": only(important, {"property": ids["Тип"], "select": {"equals": LOG_TYPES["experiment"]}}),
+            "sorts": newest_first,
+            "configuration": _log_table(ids, ["Запис", "Дата", "Ефект", "Результат", "Висновок"]),
+        },
+        {
+            "key": "dynamics",
+            "name": "📊 Динаміка",
+            "type": "table",
+            "filter": only(important, {"property": ids["Тип"], "select": {"equals": LOG_TYPES["analytics"]}}),
+            "sorts": [{"property": ids["Дата"], "direction": "ascending"}],
+            "configuration": _log_table(
+                ids, ["Запис", "Дата", "Значення", "Результат", "Висновок"],
+                group_by={"type": "select", "property_id": ids["Метрика"], "sort": {"type": "manual"},
+                          "hide_empty_groups": True},
+            ),
         },
     ]
+    if project_page_id is None:
+        specs.append({
+            "key": "all",
+            "name": "🗂 Усі записи",
+            "type": "table",
+            "sorts": newest_first,
+            "quick_filters": {ids["Тип"]: {}, ids["Проєкт"]: {}, ids["Чат"]: {}},
+            "configuration": _log_table(ids, ["Запис", "Дата", "Тип", "Важливе", "Проєкт", "Чат"]),
+        })
+    return specs
+
+
+def view_body(spec: dict[str, Any]) -> dict[str, Any]:
+    """The part of a spec the API understands."""
+    return {k: spec[k] for k in ("name", "type", "filter", "sorts", "quick_filters", "configuration") if k in spec}

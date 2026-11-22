@@ -108,6 +108,7 @@ GOOD_BRIEF = {
     "summary": "Запуск креативу B у TikTok.", "status": "Бюджет погоджено, старт у понеділок.",
     "owners": [{"person": "Аня", "area": "запуск креативу"}], "risks": ["Апрув клієнта ще не отримано"],
     "next_steps": ["Запустити креатив B до 23.11"], "open_questions": ["Хто готує звіт?"],
+    "milestones": [{"date": "2026-11-18", "text": "Старт кампанії"}], "key_decisions": [], "log": [],
 }
 
 
@@ -164,6 +165,12 @@ class FakeNotion:
             self._next += 1
             return f"{prefix}{self._next}"
 
+        def column(pid: str, spec: dict) -> dict:
+            kind = next(iter(spec))
+            extra = {"relation": {"type": spec["relation"]["type"], "data_source_id": spec["relation"]["data_source_id"],
+                                  "dual_property": spec["relation"].get("dual_property")}} if kind == "relation" else {}
+            return {"id": pid, "type": kind, **extra}
+
         def add_dual(spec_props: dict) -> None:
             for spec in spec_props.values():
                 rel = spec.get("relation") if isinstance(spec, dict) else None
@@ -189,8 +196,9 @@ class FakeNotion:
         async def db_create(parent, title, initial_data_source, icon=None, **kw):
             n = len(self.databases_created) + 1
             db_id, ds_id = f"db-{n}", f"ds-{n}"
-            props = {name: {"id": f"p{n}-{i}", "type": next(iter(spec))}
+            props = {name: column(f"p{n}-{i}", spec)
                      for i, (name, spec) in enumerate(initial_data_source["properties"].items())}
+            self.database_titles[db_id] = title[0]["text"]["content"]
             self.data_sources[ds_id] = {"properties": props}
             self.databases_created.append({"id": db_id, "title": title[0]["text"]["content"], "ds": ds_id})
             self.views[f"view-{db_id}-default"] = {"id": f"view-{db_id}-default", "name": "Default view", "database_id": db_id}
@@ -202,14 +210,32 @@ class FakeNotion:
                 self.database_titles[database_id] = kw["title"][0]["text"]["content"]
             return {"id": database_id}
 
+        async def db_retrieve(database_id):
+            return {"id": database_id, "title": [{"plain_text": self.database_titles.get(database_id, "")}]}
+
         async def ds_retrieve(data_source_id):
             return {"id": data_source_id, "properties": dict(self.data_sources[data_source_id]["properties"])}
 
-        async def ds_update(data_source_id, properties):
+        async def ds_update(data_source_id, properties=None, title=None):
             props = self.data_sources[data_source_id]["properties"]
-            for name, spec in properties.items():
-                props[name] = {"id": new_id("added-"), "type": next(iter(spec))}
-            add_dual(properties)
+            rows = [p for p in self.store.values() if p["ds"] == data_source_id]
+            for name, spec in (properties or {}).items():
+                if spec is None:  # delete the column
+                    props.pop(name)
+                    for row in rows:
+                        row["props"].pop(name, None)
+                elif "name" in spec:  # rename: the id stays
+                    props[spec["name"]] = props.pop(name)
+                    for row in rows:
+                        if name in row["props"]:
+                            row["props"][spec["name"]] = row["props"].pop(name)
+                else:
+                    old = props.get(name, {}).get("relation") or {}
+                    props[name] = column(props[name]["id"] if name in props else new_id("added-"), spec)
+                    if old.get("type") == "dual_property" and spec["relation"]["type"] == "single_property":
+                        # the mirror column on the other side disappears, the links of the rows stay (checked live)
+                        self.data_sources[old["data_source_id"]]["properties"].pop(old["dual_property"]["synced_property_name"], None)
+            add_dual({k: v for k, v in (properties or {}).items() if v and "relation" in v})
             return {"id": data_source_id}
 
         def matches(page: dict, flt: dict | None) -> bool:
@@ -220,11 +246,13 @@ class FakeNotion:
             prop = page["props"].get(flt["property"]) or {}
             if "rich_text" in flt:
                 value = "".join(t["text"]["content"] for t in prop.get("rich_text", []))
-                return value == flt["rich_text"]["equals"]
+                return bool(value) if "is_not_empty" in flt["rich_text"] else value == flt["rich_text"]["equals"]
             if "relation" in flt:
                 return flt["relation"]["contains"] in [r["id"] for r in prop.get("relation", [])]
             name = (prop.get("select") or {}).get("name")
             cond = flt["select"]
+            if "is_empty" in cond:
+                return not name
             return name == cond["equals"] if "equals" in cond else name != cond["does_not_equal"]
 
         async def ds_query(data_source_id, filter=None, page_size=100, sorts=None, start_cursor=None):
@@ -251,6 +279,11 @@ class FakeNotion:
 
         async def page_update(page_id, properties=None, icon=None, in_trash=None):
             page = self.store[page_id]
+            if page["in_trash"] and properties:
+                import httpx
+                from notion_client.errors import APIResponseError
+
+                raise APIResponseError("validation_error", 400, "Can't edit block that is archived", httpx.Headers(), "{}")
             if properties:
                 page["props"] = {**page["props"], **properties}
             if icon:
@@ -275,6 +308,8 @@ class FakeNotion:
             siblings = children_of(parent)
             siblings[:] = [b for b in siblings if b.get("id") != block_id]
             self.blocks_by_id.pop(block_id, None)
+            for vid in [v["id"] for v in self.views.values() if v.get("database_id") == block_id]:
+                del self.views[vid]
 
         async def block_update(block_id, **fields):
             if block_id not in self.blocks_by_id:
@@ -287,10 +322,16 @@ class FakeNotion:
                 block[kind] = {**block.get(kind, {}), **body}
             return block
 
-        async def children_append(block_id, children):
+        async def children_append(block_id, children, position=None):
             created = [dict(c) for c in children]
             register(created, block_id)
-            children_of(block_id).extend(created)
+            siblings = children_of(block_id)
+            at = len(siblings)
+            if (position or {}).get("type") == "start":
+                at = 0
+            elif (position or {}).get("type") == "after_block":
+                at = 1 + [b["id"] for b in siblings].index(position["after_block"]["id"])
+            siblings[at:at] = created
             return {"results": created}
 
         async def request(path, method, body=None, **kw):
@@ -305,12 +346,18 @@ class FakeNotion:
             if method == "POST" and path == "views":
                 vid = new_id("view-")
                 self.views[vid] = {"id": vid, **body}
-                if "create_database" in body:  # a linked table on a page has its own (untitled) container
-                    self.views[vid]["parent"] = {"type": "database_id", "database_id": f"linked-{vid}"}
+                container = body.get("database_id")
+                if "create_database" in body:  # a linked table on a page has its own (untitled) container block
+                    container = f"linked-{vid}"
+                    page_id = body["create_database"]["parent"]["page_id"]
+                    block = {"id": container, "type": "child_database", "child_database": {"title": "Untitled"}}
+                    register([block], page_id)
+                    children_of(page_id).append(block)
+                self.views[vid] |= {"parent": {"type": "database_id", "database_id": container}, "database_id": container}
                 return self.views[vid]
             raise AssertionError(f"unexpected request {method} {path}")
 
-        self.databases = SimpleNamespace(create=db_create, update=db_update)
+        self.databases = SimpleNamespace(create=db_create, update=db_update, retrieve=db_retrieve)
         self.data_sources_api = SimpleNamespace(retrieve=ds_retrieve, update=ds_update, query=ds_query)
         self.pages_api = SimpleNamespace(create=page_create, update=page_update, retrieve=page_retrieve)
         self.blocks = SimpleNamespace(delete=block_delete, update=block_update,
@@ -341,8 +388,9 @@ class FakeNotion:
         return [v["name"] for v in self.views.values() if v.get("database_id") == db_id]
 
     def page_view_names(self, page_id: str) -> list[str]:
-        return [v["name"] for v in self.views.values()
-                if v.get("create_database", {}).get("parent", {}).get("page_id") == page_id]
+        """Tabs of the linked tables on a page."""
+        tables = [b["id"] for b in self.store[page_id]["children"] if b["type"] == "child_database"]
+        return [v["name"] for v in self.views.values() if v.get("database_id") in tables]
 
     def as_client(self) -> SimpleNamespace:
         return SimpleNamespace(

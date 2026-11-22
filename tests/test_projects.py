@@ -42,7 +42,9 @@ def chats(page: dict) -> set[str]:
 
 
 def brief_text(env, page_id: str) -> str:
-    (callout,) = [b for b in env.notion.store[page_id]["children"] if b["type"] == "callout"]
+    children = env.notion.store[page_id]["children"]
+    (callout,) = [b for b in children if b["type"] == "callout"]
+    assert children[0] is callout  # the passport is always on top
     return json.dumps(callout, ensure_ascii=False)
 
 
@@ -133,7 +135,7 @@ async def test_decision_that_left_the_summary_leaves_the_log(env):
 
     await env.run()
 
-    texts = [d["props"]["Рішення"]["title"][0]["text"]["content"] for d in env.notion.decisions.values()
+    texts = [d["props"]["Запис"]["title"][0]["text"]["content"] for d in env.notion.decisions.values()
              if d["props"]["Чат"]["select"]["name"] == "Маркетинг"]
     assert texts == ["Бюджет $700 погоджено"]
 
@@ -149,10 +151,11 @@ async def test_brief_is_one_call_per_project_per_day_and_lands_on_the_project_pa
     (project_id, project), = env.notion.projects.items()
     text = brief_text(env, project_id)
     for expected in (GOOD_BRIEF["summary"], GOOD_BRIEF["status"], "Аня — запуск креативу", GOOD_BRIEF["risks"][0],
-                     GOOD_BRIEF["next_steps"][0], "Хто за що відповідає"):
+                     GOOD_BRIEF["next_steps"][0], "Команда: хто за що відповідає", "18.11.2026 — Старт кампанії"):
         assert expected in text
-    assert project["props"]["Бриф оновлено"]["date"]["start"] == "2026-11-20"
-    assert project["props"]["Рішень"]["number"] == 2 and project["props"]["Відкритих задач"]["number"] == 2
+    assert project["props"]["Оновлено"]["date"]["start"] == "2026-11-20"
+    columns = set(env.notion.data_sources["ds-3"]["properties"])
+    assert columns == {"Проєкт", "Чати", "Статус", "Дата релізу", "Оновлено"}  # no lists of tasks and decisions
 
     env.source.add(PRODUCT, 2, "Ще новини", at(20, 14))
     again = await env.run()
@@ -163,7 +166,7 @@ async def test_brief_is_rebuilt_from_both_chats_and_the_previous_brief_the_next_
     single(env)
     await env.run()
     first = env.llm.brief_prompts[0]
-    assert '"chat": "Маркетинг"' in first and '"chat": "Продукт"' in first and "PREVIOUS BRIEF: none" in first
+    assert '"chat": "Маркетинг"' in first and '"chat": "Продукт"' in first and "PREVIOUS PASSPORT: none" in first
     assert "Скинеш звіт" not in first and '"chat": "Олег"' not in first  # private chats stay out
 
     env.now += timedelta(days=1)
@@ -251,7 +254,7 @@ async def test_bad_answers_of_the_model_cannot_eat_the_daily_quota(env):
     for _ in range(6):  # a sync every 30 minutes
         await env.run()
     assert env.llm.brief_calls == 3  # three attempts, then the project waits for tomorrow
-    assert env.db.kv_get("project_briefs_done_on") == "2026-11-20"
+    assert env.db.kv_get("project_briefs_done_on") .startswith("2026-11-20")
 
     env.llm.brief_queue = []
     env.now += timedelta(days=1)
@@ -290,17 +293,20 @@ async def test_live_views_are_created_once_and_the_checklist_follows_the_release
     single(env)
     await env.run()
     (project_id, project), = env.notion.projects.items()
-    names = ["🎯 Рішення проєкту", "✅ Задачі проєкту", "🚀 Чек-лист до релізу"]
-    assert env.notion.page_view_names(project_id) == names
-    assert list(env.notion.database_titles.values()) == names  # not «Untitled»; the source databases keep their names
-    assert all(db_id.startswith("linked-") for db_id in env.notion.database_titles)
+    names = ["📒 Важливе", "🧪 Тести", "📊 Динаміка"]
+    assert env.notion.page_view_names(project_id) == names  # three tabs of ONE table
+    tables = [b["id"] for b in env.notion.store[project_id]["children"] if b["type"] == "child_database"]
+    assert len(tables) == 1 and env.notion.database_titles[tables[0]] == "📒 Журнал проєкту"  # not «Untitled»
+    assert env.notion.database_titles["db-4"] == "Telegram — журнал проєкту"  # the source keeps its name
+    assert "🚀 До релізу · Тестовий проєкт" in env.notion.view_names("db-2")  # the checklist lives in the tasks database
 
     project["props"]["Дата релізу"] = {"date": {"start": "2026-12-05"}}
     env.now += timedelta(days=1)
     await env.run()
 
     assert env.notion.page_view_names(project_id) == names  # nothing duplicated
-    checklist = next(v for v in env.notion.views.values() if v["name"] == names[2])
+    assert env.notion.view_names("db-2").count("🚀 До релізу · Тестовий проєкт") == 1
+    checklist = next(v for v in env.notion.views.values() if v["name"].startswith("🚀 До релізу"))
     assert {"property": "Дедлайн", "date": {"on_or_before": "2026-12-05"}} in checklist["filter"]["and"]
 
 

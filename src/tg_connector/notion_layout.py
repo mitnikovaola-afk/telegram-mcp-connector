@@ -379,10 +379,23 @@ build_properties = build_day_properties
 # ---------------------------------------------------------------- projects (beyond the task)
 
 PROJECTS_TITLE = "Telegram — проєкти"
-DECISIONS_TITLE = "Telegram — рішення"
+LOG_TITLE = "Telegram — журнал проєкту"
+OLD_LOG_TITLE = "Telegram — рішення"  # the first version of this database held decisions only
 PROJECT_ACTIVE, PROJECT_PAUSED, PROJECT_DONE = "Активний", "На паузі", "Завершено"
 # Columns the USER owns on a project (set once on creation, never overwritten by the connector).
 PROJECT_USER_COLUMNS = ("Проєкт", "Чати", "Статус", "Дата релізу")
+
+LOG_DECISION = "🎯 Рішення"
+LOG_TYPES = {
+    "decision": LOG_DECISION,
+    "experiment": "🧪 Тест",
+    "analytics": "📊 Аналітика",
+    "release": "🚀 Реліз",
+    "incident": "⚠️ Проблема",
+}
+LOG_EFFECTS = {"worked": "✅ Спрацювало", "failed": "❌ Не спрацювало", "in_progress": "🔄 У процесі"}
+# Columns the connector fills on log rows; whatever the user changes there afterwards stays the user's.
+LOG_AI_COLUMNS = ("Запис", "Дата", "Тип", "Результат", "Ефект", "Висновок", "Метрика", "Значення")
 
 
 def project_properties_schema() -> dict[str, Any]:
@@ -399,37 +412,47 @@ def project_properties_schema() -> dict[str, Any]:
             }
         },
         "Дата релізу": {"date": {}},
-        "Бриф оновлено": {"date": {}},
-        "Відкритих задач": {"number": {"format": "number"}},
-        "Рішень": {"number": {"format": "number"}},
-        "Key": {"rich_text": {}},
-    }
-
-
-def decision_properties_schema(projects_data_source_id: str) -> dict[str, Any]:
-    return {
-        "Рішення": {"title": {}},
-        "Дата": {"date": {}},
-        "Чат": {"select": {}},
-        "Проєкт": {
-            "relation": {
-                "data_source_id": projects_data_source_id,
-                "type": "dual_property",
-                "dual_property": {"synced_property_name": "Рішення"},
-            }
-        },
-        "Key": {"rich_text": {}},
+        "Оновлено": {"date": {}},
     }
 
 
 def project_relation_spec(projects_data_source_id: str) -> dict[str, Any]:
-    """«Проєкт» column added to the tasks database (two-way: the project gets «Задачі»)."""
+    """One-way «Проєкт» link: rows know their project, the project page is not flooded with lists of rows."""
+    return {"relation": {"data_source_id": projects_data_source_id, "type": "single_property", "single_property": {}}}
+
+
+def log_properties_schema(projects_data_source_id: str) -> dict[str, Any]:
     return {
-        "relation": {
-            "data_source_id": projects_data_source_id,
-            "type": "dual_property",
-            "dual_property": {"synced_property_name": "Задачі"},
-        }
+        "Запис": {"title": {}},
+        "Дата": {"date": {}},
+        "Тип": {
+            "select": {
+                "options": [
+                    {"name": LOG_TYPES["decision"], "color": "blue"},
+                    {"name": LOG_TYPES["experiment"], "color": "purple"},
+                    {"name": LOG_TYPES["analytics"], "color": "green"},
+                    {"name": LOG_TYPES["release"], "color": "orange"},
+                    {"name": LOG_TYPES["incident"], "color": "red"},
+                ]
+            }
+        },
+        "Важливе": {"checkbox": {}},
+        "Результат": {"rich_text": {}},
+        "Ефект": {
+            "select": {
+                "options": [
+                    {"name": LOG_EFFECTS["worked"], "color": "green"},
+                    {"name": LOG_EFFECTS["failed"], "color": "red"},
+                    {"name": LOG_EFFECTS["in_progress"], "color": "yellow"},
+                ]
+            }
+        },
+        "Висновок": {"rich_text": {}},
+        "Метрика": {"select": {}},
+        "Значення": {"number": {"format": "number"}},
+        "Чат": {"select": {}},
+        "Проєкт": project_relation_spec(projects_data_source_id),
+        "Key": {"rich_text": {}},
     }
 
 
@@ -438,51 +461,78 @@ def decision_key(chat_id: int, local_date: str, text: str) -> str:
     return f"{chat_id}:{local_date}:{digest}"
 
 
-def build_decision_properties(row: Any, text: str, key: str, project_ids: list[str]) -> dict[str, Any]:
-    return {
-        "Рішення": {"title": [_rt(text)]},
+def build_decision_properties(row: Any, text: str, key: str, project_ids: list[str], *, new: bool) -> dict[str, Any]:
+    """A decision as it stands in the day summary. Type, importance and conclusion are set later (by the daily
+    update) or by the user, so an update of the row never touches them."""
+    props = {
+        "Запис": {"title": [_rt(text)]},
         "Дата": {"date": {"start": row["local_date"]}},
         "Чат": {"select": {"name": _select_name(row["title"] or str(row["chat_id"]))}},
         "Проєкт": {"relation": [{"id": pid} for pid in project_ids]},
         "Key": {"rich_text": [_rt(key)]},
     }
+    return props | {"Тип": {"select": {"name": LOG_DECISION}}} if new else props
 
 
-def build_new_project_properties(chat_name: str, key: str) -> dict[str, Any]:
+def build_log_properties(entry: dict[str, Any]) -> dict[str, Any]:
+    """Columns of a log row written by the daily update (tests, analytics, releases, problems)."""
+    metric = _select_name(entry.get("metric") or "")
+    effect = LOG_EFFECTS.get(entry.get("effect") or "")
+    return {
+        "Запис": {"title": [_rt(entry["title"])]},
+        "Дата": {"date": {"start": entry["date"]}},
+        "Тип": {"select": {"name": LOG_TYPES[entry["type"]]}},
+        "Результат": {"rich_text": [_rt(entry["result"])] if entry.get("result") else []},
+        "Ефект": {"select": {"name": effect} if effect else None},
+        "Висновок": {"rich_text": [_rt(entry["takeaway"])] if entry.get("takeaway") else []},
+        "Метрика": {"select": {"name": metric} if metric else None},
+        "Значення": {"number": entry.get("value")},
+    }
+
+
+def plain_value(prop: dict[str, Any] | None) -> Any:
+    """Comparable value of a Notion property, both as sent by us and as returned by the API."""
+    prop = prop or {}
+    for kind in ("title", "rich_text"):
+        if kind in prop:
+            return "".join(t.get("plain_text") or t.get("text", {}).get("content", "") for t in prop[kind] or []).strip()
+    if "select" in prop:
+        return (prop["select"] or {}).get("name")
+    if "date" in prop:
+        return (prop["date"] or {}).get("start")
+    if "number" in prop:
+        return prop["number"]
+    return bool(prop.get("checkbox"))
+
+
+def build_new_project_properties(chat_name: str) -> dict[str, Any]:
     return {
         "Проєкт": {"title": [_rt(chat_name)]},
         "Чати": {"multi_select": [{"name": _select_name(chat_name)}]},
         "Статус": {"select": {"name": PROJECT_ACTIVE}},
-        "Key": {"rich_text": [_rt(key)]},
     }
 
 
-def build_project_counters(updated_on: str | None, open_tasks: int | None, decisions: int) -> dict[str, Any]:
-    props: dict[str, Any] = {"Рішень": {"number": decisions}}
-    if updated_on:
-        props["Бриф оновлено"] = {"date": {"start": updated_on}}
-    if open_tasks is not None:
-        props["Відкритих задач"] = {"number": open_tasks}
-    return props
-
-
-BRIEF_TITLE = "🧭 Бриф проєкту"
+PASSPORT_TITLE = "🧭 Паспорт проєкту"
 
 
 def build_brief_header(updated_on: str, model: str) -> list[dict[str, Any]]:
-    return [_rt(f"{BRIEF_TITLE} · оновлено {human_date(updated_on)}", bold=True), _rt(f" · {model}", color="gray")]
+    return [_rt(f"{PASSPORT_TITLE} · оновлено {human_date(updated_on)}", bold=True), _rt(f" · {model}", color="gray")]
 
 
-def build_brief_children(brief: dict[str, Any]) -> list[dict[str, Any]]:
-    """Children of the brief callout. The callout is the only part of a project page the connector rewrites."""
+def build_brief_children(brief: dict[str, Any], today: str) -> list[dict[str, Any]]:
+    """Children of the passport callout: the only part of a project page the connector rewrites."""
     blocks: list[dict[str, Any]] = []
     if brief.get("summary"):
-        blocks.append(_block("paragraph", [_rt(brief["summary"], italic=True)]))
+        blocks += [_heading("📌 Про проєкт"), _block("paragraph", brief["summary"])]
     if brief.get("status"):
         blocks += [_heading("📍 Поточний стан"), _block("paragraph", brief["status"])]
     owners = [f"{o['person']} — {o['area']}" for o in brief.get("owners", []) if o.get("person")]
+    milestones = [f"{human_date(m['date'])} — {m['text']}" + (" (план)" if m["date"] > today else "")
+                  for m in brief.get("milestones", [])]
     sections = [
-        ("👥 Хто за що відповідає", owners),
+        ("👥 Команда: хто за що відповідає", owners),
+        ("🗓 Віхи проєкту", milestones),
         ("⚠️ Ризики й блокери", brief.get("risks", [])),
         ("➡️ Наступні кроки", brief.get("next_steps", [])),
         ("❓ Відкриті питання", brief.get("open_questions", [])),
@@ -490,26 +540,38 @@ def build_brief_children(brief: dict[str, Any]) -> list[dict[str, Any]]:
     for title, items in sections:
         if items:
             blocks += [_heading(title), *_bullets(items)]
-    return blocks or [_block("paragraph", [_rt("Поки що немає даних для брифу.", color="gray")])]
+    return blocks or [_block("paragraph", [_rt("Поки що немає даних для паспорта.", color="gray")])]
 
 
-def project_view_specs(project_page_id: str, release_date: str | None, t: dict[str, str],
-                       d: dict[str, str]) -> list[dict[str, Any]]:
-    """Linked views embedded on a project page (key → spec without data_source_id/placement).
-    `t` / `d`: current column names of the tasks / decisions databases (the user may have renamed them)."""
-    in_project = {"property": t["Проєкт"], "relation": {"contains": project_page_id}}
-    checklist_date = (
+def build_team_section() -> list[dict[str, Any]]:
+    """Template created once; from then on it belongs to the team."""
+
+    def hint(text: str) -> dict[str, Any]:
+        return _block("bulleted_list_item", [_rt(text, color="gray", italic=True)])
+
+    return [
+        _block("heading_2", "✍️ Від команди"),
+        _block("paragraph", [_rt("Те, чого немає в чатах. Цей розділ пишете ви: конектор його не змінює.", color="gray")]),
+        _heading("🚦 З чого почати новачку"),
+        hint("перші кроки, кого спитати, що прочитати"),
+        _heading("🔑 Доступи"),
+        hint("назва сервісу і хто видає доступ; паролі й ключі тут не зберігаємо"),
+        _heading("☎️ Контакти"),
+        hint("імʼя, роль, як звʼязатися"),
+        _heading("📚 Документи й посилання"),
+        hint("дизайн, аналітика, таск-трекер, регламенти"),
+    ]
+
+
+def checklist_view_spec(project_page_id: str, title: str, release_date: str | None, t: dict[str, str]) -> dict[str, Any]:
+    """Pre-release checklist: a view of the TASKS database. `t`: current column names there."""
+    date_filter = (
         {"property": t["Дедлайн"], "date": {"on_or_before": release_date}}
         if release_date else {"property": t["Дедлайн"], "date": {"is_not_empty": True}}
     )
-    return [
-        {"key": "decisions", "db": "decisions", "name": "🎯 Рішення проєкту", "type": "table",
-         "filter": {"property": d["Проєкт"], "relation": {"contains": project_page_id}},
-         "sorts": [{"property": d["Дата"], "direction": "descending"}]},
-        {"key": "tasks", "db": "tasks", "name": "✅ Задачі проєкту", "type": "table",
-         "filter": {"and": [in_project, {"property": t["Стан"], "select": {"does_not_equal": TASK_DONE}}]},
-         "sorts": [{"property": t["Дедлайн"], "direction": "ascending"}]},
-        {"key": "checklist", "db": "tasks", "name": "🚀 Чек-лист до релізу", "type": "table",
-         "filter": {"and": [in_project, checklist_date]},
-         "sorts": [{"property": t["Дедлайн"], "direction": "ascending"}]},
-    ]
+    return {
+        "name": f"🚀 До релізу · {title}"[:100],
+        "type": "table",
+        "filter": {"and": [{"property": t["Проєкт"], "relation": {"contains": project_page_id}}, date_filter]},
+        "sorts": [{"property": t["Дедлайн"], "direction": "ascending"}],
+    }

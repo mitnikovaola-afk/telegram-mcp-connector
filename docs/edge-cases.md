@@ -49,17 +49,31 @@
 
 | Ситуація | Що робить конектор | Перевірка |
 |---|---|---|
-| Кілька синхронізацій за день | бриф оновлюється **один раз на добу**: перший прогін після `PROJECT_BRIEF_HOUR` | `test_brief_is_one_call_per_project_per_day_and_lands_on_the_project_page`, `test_brief_waits_for_the_morning_hour` |
+| Кілька синхронізацій за день | паспорт і журнал оновлюються **один раз на добу**: перший прогін після `PROJECT_BRIEF_HOUR` | `test_brief_is_one_call_per_project_per_day_and_lands_on_the_project_page`, `test_brief_waits_for_the_morning_hour` |
 | Тихий день, нових самарі немає | LLM не викликається | `test_no_new_summaries_means_no_llm_call` |
-| День підсумовано із запізненням (квота, збій) | конектор памʼятає версію кожного дня в брифі, тому запізнілий день потрапляє в наступний | `test_a_day_summarized_late_still_reaches_the_brief` |
-| Чат додали до проєкту пізніше | у бриф потрапляють його дні за останні 14 днів, звʼязки старих задач і рішень перевʼязуються | `test_chat_added_to_a_project_brings_its_history`, `test_links_of_old_days_follow_when_the_user_changes_the_chats_column` |
+| День підсумовано із запізненням (квота, збій) | конектор памʼятає, яку версію кожного дня враховано, тому запізнілий день потрапляє в наступне оновлення | `test_a_day_summarized_late_still_reaches_the_brief` |
+| Чат додали до проєкту пізніше | враховуються його дні за останні 14 днів, звʼязки старих задач і рішень перевʼязуються | `test_chat_added_to_a_project_brings_its_history`, `test_links_of_old_days_follow_when_the_user_changes_the_chats_column` |
 | Користувач прибрав чат із проєкту, змінив назву чи статус | колонки користувача не перезаписуються, чат назад не додається | `test_user_owned_columns_are_never_overwritten` |
 | Рішення з **особистого** чату | не потрапляє в журнал, доки користувач сам не додасть чат до проєкту | `test_links_of_old_days_follow_when_the_user_changes_the_chats_column` |
+| Рутинне рішення («планерка о 10:00») | є в базі, але без «Важливе»: на сторінку проєкту не потрапляє | `test_only_decisions_the_model_calls_important_are_marked` |
+| Користувач зняв «Важливе» | галочка не повертається, навіть якщо модель знову вважає рішення важливим | `test_unticked_by_the_user_stays_unticked` |
+| Тест почався в один день, результат прийшов в інший | оновлюється **той самий** рядок: результат, ефект, висновок | `test_result_of_a_test_updates_its_row_instead_of_adding_a_new_one` |
+| Та сама метрика виміряна знову | новий рядок на новий день із тією самою назвою метрики: видно динаміку | `test_a_metric_gets_one_row_per_day_so_its_dynamics_stay` |
+| Модель повторює вже записане | дублів немає, бідніший повтор не стирає відомого | `test_repeated_answers_create_no_duplicates`, `test_a_poorer_repeat_does_not_erase_what_is_already_known` |
+| Користувач змінив значення в рядку журналу | його текст лишається, інші колонки рядка оновлюються, модель бачить правку | `test_values_edited_by_the_user_are_not_overwritten`, `test_users_own_conclusion_is_kept_when_a_decision_is_marked` |
+| Користувач видалив рядок журналу | рядок не створюється знову, модель бачить список видаленого | `test_a_removed_row_is_never_created_again` |
+| Користувач додав власний рядок | модель його бачить, але не змінює й не дублює | `test_rows_added_by_the_user_are_shown_to_the_model_but_never_changed` |
+| Рядок задачі чи рішення лежить у кошику, а день вивантажується знову | Notion відмовляє у зміні такого рядка (перевірено вживу): конектор поважає видалення, день не падає | `test_row_of_a_decision_or_task_in_the_trash_does_not_block_the_export` |
+| Процес упав між створенням рядка в Notion і записом його id | рядок знаходиться за `Key`, другого не буде | `test_crash_between_creating_a_row_and_remembering_it_makes_no_second_row` |
+| Негодні дані від моделі: порожні назви, дати з майбутнього, вигадані id, сотні записів | очищуються або відкидаються, не більше 25 нових записів за раз | `test_bad_items_are_cleaned_or_dropped`, `test_one_answer_cannot_flood_the_log` |
 | Рішення скасували протягом дня | рядок у журналі зникає разом із рішенням у самарі; повторні прогони дублів не створюють | `test_decision_that_left_the_summary_leaves_the_log`, `test_decisions_and_tasks_are_linked_to_the_project_and_never_duplicated` |
-| Модель стабільно повертає негодний бриф | 3 спроби на день, потім проєкт чекає до завтра (інакше 48 прогонів на добу зʼїли б квоту) | `test_bad_answers_of_the_model_cannot_eat_the_daily_quota` |
-| Квоту LLM вичерпано | бриф чекає на відновлення квоти, прогін триває | `test_quota_outage_keeps_the_brief_for_later_and_the_run_survives` |
+| Модель стабільно повертає негодну відповідь | 3 спроби на день, потім проєкт чекає до завтра (інакше 48 прогонів на добу зʼїли б квоту) | `test_bad_answers_of_the_model_cannot_eat_the_daily_quota` |
+| Квоту LLM вичерпано | оновлення чекає на відновлення квоти, прогін триває | `test_quota_outage_keeps_the_brief_for_later_and_the_run_survives` |
 | Notion відмовив у базах проєктів | самарі й задачі вивантажуються, статус `partial`; пропущене довантажується потім | `test_project_setup_failure_does_not_block_summaries_and_tasks`, `test_tasks_relation_failure_does_not_block_the_next_runs` |
-| Користувач видалив блок брифу | наступне оновлення створить його знову, решту сторінки не чіпає | `test_deleted_brief_block_is_created_again` |
+| Команда переробила розділ «Від команди» або видалила його частину | конектор цей розділ більше не чіпає | `test_team_section_is_created_once_and_never_touched_again` |
+| Користувач видалив блок паспорта | наступне оновлення створить його знову вгорі сторінки, решту не чіпає | `test_deleted_brief_block_is_created_again` |
+| Користувач перейменував колонку журналу | конектор іде за id колонки | `test_columns_renamed_by_the_user_are_followed_in_the_log` |
+| Бази створила попередня версія | переїзд на місці: рядки, звʼязки й блоки користувача лишаються | `test_first_version_of_the_databases_is_migrated_in_place` |
 | Prompt injection у самарі чи назві проєкту | дані екрануються й не можуть закрити свій блок у промпті | `test_project_data_cannot_close_its_own_block` |
 
 ## B3. Хмара (Railway)

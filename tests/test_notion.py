@@ -52,7 +52,7 @@ async def test_two_linked_databases_and_views_are_created_once(env):
     await env.run()
 
     assert [d["title"] for d in env.notion.databases_created] == [
-        "Telegram — денні самарі", "Telegram — задачі", "Telegram — проєкти", "Telegram — рішення"]
+        "Telegram — денні самарі", "Telegram — задачі", "Telegram — проєкти", "Telegram — журнал проєкту"]
     assert env.notion.view_names("db-1") == ["📰 Стрічка", "🗂 За чатами", "🗓 Календар", "❓ Є відкриті питання"]
     assert env.notion.view_names("db-2") == ["🔥 Відкриті задачі", "📋 Дошка", "👤 За людьми", "🗓 Дедлайни"]
     assert env.db.kv_get(KV_LAYOUT) == LAYOUT_VERSION
