@@ -160,8 +160,14 @@ Telegram, Notion і безкоштовний тариф Gemini коштують 
    uv run tg-connector snapshot data/transfer.db
    # встановіть Railway CLI: https://docs.railway.com/guides/cli
    railway login
-   railway link
-   railway volume files upload data/transfer.db /data/connector.db
+   railway link                       # проєкт, середовище production, сервіс
+   # тимчасовий SSH-ключ: файли на volume передаються через SFTP
+   ssh-keygen -t ed25519 -N "" -C railway-temp -f ~/.ssh/railway_ed25519
+   railway ssh keys add --key ~/.ssh/railway_ed25519.pub --name railway-temp
+   railway volume files --volume <імʼя volume> upload data/transfer.db /connector.db
+   # прибрати тимчасове: ключ із Railway і з компʼютера, копію бази
+   railway ssh keys remove <fingerprint з railway ssh keys list>
+   rm ~/.ssh/railway_ed25519 ~/.ssh/railway_ed25519.pub data/transfer.db
    ```
 8. Перевірте логи сервісу: має зʼявитися `Bot @… is running (sync in this process: True)`, а згодом перший `Scheduled run finished`.
 
@@ -170,7 +176,9 @@ Telegram, Notion і безкоштовний тариф Gemini коштують 
 Хмара має продовжити з локального стану: курсори, відстежувані чати, id баз Notion. Інакше вона почне з нуля і створить **другі бази в Notion**.
 
 1. Локально зробіть цілісну копію бази: `uv run tg-connector snapshot data/transfer.db`. База працює в режимі WAL, тому простого копіювання файлу недостатньо.
-2. Завантажте її через Railway CLI: `railway volume files upload data/transfer.db /data/connector.db`.
+2. Завантажте її через Railway CLI: `railway volume files --volume <імʼя volume> upload data/transfer.db /connector.db`.
+   - **Шлях рахується від кореня volume:** `/connector.db` на volume і є `/data/connector.db` у контейнері. Якщо вказати `/data/connector.db`, файл ляже в `/data/data/`, і сервіс чекатиме далі.
+   - **Потрібен SSH-ключ,** бо передача йде через SFTP. Ми створили тимчасовий ключ лише для цього завантаження й одразу після нього видалили його з Railway і з компʼютера (див. крок 7).
 
 **Поки файлу немає, хмара чекає, а не стартує з нуля.** Зі змінною `WAIT_FOR_STATE=true` команда `bot --sync` щохвилини пише в лог, що чекає на завантаження бази, і стартує, лише коли зʼявиться `/data/connector.db`.
 

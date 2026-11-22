@@ -451,3 +451,39 @@ Notion   : created=0 updated=0 skipped_empty=0 failed=0
    Notion   : created=0 updated=2 skipped_empty=0 failed=0
               tasks: created=0 updated=3 removed=0
    ```
+
+---
+
+# День 4 (22.11): переїзд у хмару (Railway)
+
+Синхронізація і командний бот тепер працюють 24/7 на Railway як **один процес** `tg-connector bot --sync` з volume `/data`. MCP-сервер для Claude лишився локальним, локальні бот і синхронізація вимкнені.
+
+## Як переїхали
+
+| Крок | Хто | Результат |
+|---|---|---|
+| Проєкт із GitHub-репозиторію, доступ застосунку Railway лише до цього репозиторію | користувачка | збірка з `Dockerfile` пройшла з першого разу |
+| Volume `/data`, змінні (секрети як sealed), `WAIT_FOR_STATE=true`, `READ_ONLY=true`, `RAW_RETENTION_DAYS=14` | користувачка | сервіс **чекає** на базу і нічого не створює в Notion |
+| Окрема хмарна сесія Telegram: `login --cloud` → буфер обміну → `TG_SESSION` | разом | новий пристрій `tg-mcp-connector-cloud`; файл сесії й буфер обміну одразу очищено |
+| Зупинка локального бота, `SYNC_INTERVAL_MINUTES=0` локально, `tg-connector snapshot` | конектор | узгоджена копія бази (122 880 байт, 2 відстежувані чати) |
+| Тимчасовий SSH-ключ → `railway volume files upload` → ключ видалено з Railway і з компʼютера, копію бази видалено | разом | база на volume, тимчасового доступу не лишилось |
+
+Поки бази не було, хмара чекала, а не стартувала з нуля (інакше зʼявились би **другі бази в Notion**):
+```
+WARNING tg_connector.bot: Waiting for the database upload to /data/connector.db (WAIT_FOR_STATE=true) …
+```
+Після завантаження:
+```
+INFO tg_connector.bot: Database found at /data/connector.db (122880 bytes) — starting
+INFO tg_connector.bot: Bot @holywatertest_bot is running (sync in this process: True)
+INFO tg_connector.sync: Synced Маркетинг (тест): fetched=0 new=0 updated=0 deleted=0 days_changed=0
+INFO tg_connector.sync: Synced Продукт (тест): fetched=0 new=0 updated=0 deleted=0 days_changed=0
+INFO tg_connector.server: Scheduled run finished: ok
+```
+Хмара продовжила **з того самого курсора**: 0 нових повідомлень, дублів немає, у Notion ті самі дві бази. На `/status` у «Продукт (тест)» відповів уже хмарний бот (локальний вимкнений), дані станом на час хмарної синхронізації.
+
+## Знахідки дня 4
+
+1. **Шлях на volume рахується від кореня volume.** `railway volume files upload … /data/connector.db` поклав би файл у `/data/data/connector.db`, і сервіс чекав би вічно. Перевірили через `railway volume files ls /` (там уже була папка `logs/` сервісу), завантажили в `/connector.db`. README виправлено.
+2. **Змінні Railway застосовуються лише після Deploy.** Перший запуск після завантаження бази не бачив `TG_SESSION`: змінна була додана, але не застосована. Синхронізація чесно впала з `NotAuthorized`, бот при цьому працював. Після Deploy усе пройшло. Захист `WAIT_FOR_STATE` спрацював як треба: без бази сервіс нічого не створював.
+3. **Для `railway volume files` потрібен SSH-ключ.** Створено тимчасовий ключ лише для завантаження і одразу видалено, тож постійного SSH-доступу до сервісу немає.
