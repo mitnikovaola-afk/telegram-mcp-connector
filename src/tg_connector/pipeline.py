@@ -85,7 +85,7 @@ class Pipeline:
                 if self.sink is None:
                     report["notion"] = {"skipped": "NOTION_TOKEN / NOTION_PARENT_PAGE_ID are not set"}
                 else:
-                    report["notion"] = await self.sink.export_pending()
+                    report["notion"] = await self.sink.export_pending(heartbeat)
 
             if summarize and export and self.settings.projects_enabled and self.sink is not None and self.llm is not None:
                 report["projects"] = await update_briefs(self.db, self.llm, self.sink, self.settings, now, heartbeat)

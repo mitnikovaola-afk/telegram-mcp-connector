@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 WINDOW_DAYS = 14  # how far back new/changed day summaries are looked for
 MAX_OWNERS, MAX_ITEMS, MAX_MILESTONES = 8, 5, 12
 # Bump when the passport/log format changes: every project is rebuilt once from the whole window.
-BRIEF_VERSION = 2
+BRIEF_VERSION = 3  # v3: milestones as short noun phrases, the «(план)» mark is added by code
 MAX_ATTEMPTS_PER_DAY = 3  # bad answers of the model: after that the project waits for tomorrow
 
 

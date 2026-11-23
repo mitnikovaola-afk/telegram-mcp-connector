@@ -41,16 +41,23 @@ def _thinking_level(raw: str | None) -> str:
     return "" if value in {"default", "off", "none", "0"} else value
 
 
-_NOTION_ID_RE = re.compile(r"([0-9a-f]{32})", re.IGNORECASE)
+_NOTION_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+_NOTION_ID_RE = re.compile(r"[0-9a-f]{32}", re.IGNORECASE)
 
 
 def parse_notion_id(value: str | None) -> str | None:
-    """Accepts a bare page id or a full Notion page URL and returns the 32-hex id."""
+    """Accepts a bare page id (with or without dashes) or a full Notion page URL and returns the 32-hex id.
+
+    In a URL the id is the LAST 32 hex characters of the last path segment («My-page-<id>»): dashes must not be
+    removed first, otherwise a title ending in a–f or a digit («My-page», «Plan-2026») shifts the id.
+    """
     if not value:
         return None
-    compact = value.replace("-", "")
-    matches = _NOTION_ID_RE.findall(compact)
-    return matches[-1].lower() if matches else None
+    segment = value.strip().split("?")[0].split("#")[0].rstrip("/").rsplit("/", 1)[-1]
+    if uuid := _NOTION_UUID_RE.fullmatch(segment):
+        return uuid.group(0).replace("-", "").lower()
+    ids = [m.group(0) for m in _NOTION_ID_RE.finditer(segment) if m.end() == len(segment)]
+    return ids[-1].lower() if ids else None
 
 
 @dataclass(frozen=True)

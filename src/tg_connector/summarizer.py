@@ -5,8 +5,9 @@ Reliability around the LLM:
   as for the stored summary (input_hash), the LLM is NOT called again;
 * the model must answer in a fixed JSON schema; the answer is validated with pydantic and
   re-requested (with the validation error) if it does not fit;
-* transient errors (429/5xx) leave the day dirty with attempts+1 — it is retried on the next run,
-  so an LLM outage delays summaries but never loses them;
+* transient errors (429/5xx, timeouts) leave the day dirty without spending an attempt — it is retried
+  on the next run (after a daily-quota error, only once the quota resets), so an LLM outage delays
+  summaries but never loses them; only answers that repeatedly fail validation spend attempts;
 * chat content is wrapped as untrusted data (prompt-injection guard), links are extracted
   deterministically instead of by the model.
 """
@@ -35,7 +36,7 @@ log = logging.getLogger(__name__)
 
 PROMPT_VERSION = "2026-11-21.v5"
 MAX_ITEMS = 5
-MAX_MESSAGE_CHARS = 1500
+MAX_MESSAGE_CHARS = 4000  # one message; longer ones are cut with a marker the model sees
 QUOTE_CHARS = 160
 NOT_TRANSCRIBED_KINDS = {"voice", "video_note"}
 VALIDATION_RETRIES = 2

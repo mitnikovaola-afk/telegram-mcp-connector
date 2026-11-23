@@ -13,7 +13,7 @@ from notion_client.errors import APIResponseError
 
 from tg_connector.notion_layout import LOG_TYPES
 from tg_connector.notion_sink import KV_SERVICE_PAGE
-from tg_connector.project_brief import ProjectBrief
+from tg_connector.project_brief import BRIEF_VERSION, ProjectBrief
 from tg_connector.project_log import LogContext
 
 MARKETING, PRODUCT = -1001, -1002
@@ -86,7 +86,7 @@ async def test_a_decision_removed_by_the_user_never_comes_back(env):
     next(iter(env.notion.decisions.values()))["in_trash"] = True
 
     answer(env, key_decisions=[{"id": "D1", "takeaway": "знову важливе"}])
-    env.db.conn.execute("UPDATE project_briefs SET input_hash = '{\"_v\": 2}'")  # the model sees the same days again
+    env.db.conn.execute("UPDATE project_briefs SET input_hash = ?", (json.dumps({"_v": BRIEF_VERSION}),))  # the model sees the same days again
     await next_day(env, 21)
 
     assert "D1" in env.llm.brief_prompts[1] and rows(env, "decision") == []
@@ -96,15 +96,15 @@ async def test_a_decision_already_in_the_log_is_not_rewritten_on_every_run(env):
     answer(env, key_decisions=[{"id": "D1", "takeaway": "Щоб дотестувати"}])
     await env.run()
     answer(env, key_decisions=[{"id": "D1", "takeaway": "Інші слова про те саме"}])
-    env.db.conn.execute("UPDATE project_briefs SET input_hash = '{\"_v\": 2}'")  # the model sees the same days again
+    env.db.conn.execute("UPDATE project_briefs SET input_hash = ?", (json.dumps({"_v": BRIEF_VERSION}),))  # the model sees the same days again
     await next_day(env, 21)
     assert [r["Висновок"] for r in rows(env, "decision")] == ["Щоб дотестувати"]
 
 
 async def test_a_new_passport_format_rebuilds_every_project_once_the_same_day(env):
     await env.run()
-    env.db.conn.execute("UPDATE project_briefs SET input_hash = replace(input_hash, '\"_v\": 2', '\"_v\": 1')")
-    env.db.kv_set("project_briefs_done_on", "2026-11-20 v1")
+    env.db.conn.execute("UPDATE project_briefs SET input_hash = replace(input_hash, ?, '\"_v\": 1')", (f'"_v": {BRIEF_VERSION}',))
+    env.db.kv_set("project_briefs_done_on", f"2026-11-20 v{BRIEF_VERSION - 1}")
     for _ in range(2):
         await env.run()
     assert env.llm.brief_calls == 2 and '"date": "2026-11-20"' in env.llm.brief_prompts[1]

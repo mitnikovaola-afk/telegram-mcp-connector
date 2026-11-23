@@ -1,9 +1,10 @@
 """How summaries look in Notion: database schemas, page properties and page content.
 
-Two databases, the pattern used by meeting-notes tools (Notion AI Meeting Notes, Fireflies, n8n
+Two core databases, the pattern used by meeting-notes tools (Notion AI Meeting Notes, Fireflies, n8n
 templates): one row per chat-day with a readable page, and a separate tasks database where every
 action item is a row with owner, real due date and state — so tasks can be filtered, sorted,
-put on a board or a calendar. Days and tasks are linked by a two-way relation.
+put on a board or a calendar. Days and tasks are linked by a two-way relation. Beyond the task: a
+projects database and the project log (passport + important decisions, tests, metrics on a project page).
 
 Everything here is pure (no API calls), so it is unit-tested directly.
 """

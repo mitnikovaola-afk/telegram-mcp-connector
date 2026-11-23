@@ -1,4 +1,4 @@
-"""Ready-made views of the two Notion databases (Notion Views API, version 2026-03-11).
+"""Ready-made views of the Notion databases (Notion Views API, version 2026-03-11).
 
 Created once by the connector, so a fresh install looks the same for everyone. Views the user
 created or renamed are never touched: a view is created only if no view with its name exists,

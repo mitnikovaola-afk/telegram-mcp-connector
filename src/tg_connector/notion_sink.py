@@ -1,6 +1,7 @@
 """Stage 3 of the pipeline: publish summaries to Notion (the human-readable view).
 
-Two linked databases (see notion_layout.py) plus ready-made views (notion_views.py).
+Linked databases (days, tasks; and, beyond the task, projects + the project log, see notion_layout.py)
+plus ready-made views (notion_views.py).
 SQLite stays the source of truth; Notion is a projection of it. Idempotency:
 * a summary is exported only when its export_hash (or the page layout version) changed;
 * Notion page ids of days and tasks are stored locally, so an update edits the same pages;
@@ -677,7 +678,8 @@ class NotionSink:
             self.db.forget_notion_task(chat_id, local_date, key)
         return linked
 
-    async def export_pending(self) -> dict[str, Any]:
+    async def export_pending(self, heartbeat: Any = lambda: None) -> dict[str, Any]:
+        """Publish new/changed summaries. `heartbeat` extends the run lock: a big backlog can take minutes."""
         stats: dict[str, Any] = {
             "created": 0, "updated": 0, "skipped_empty": 0, "failed": 0,
             "tasks_created": 0, "tasks_updated": 0, "tasks_removed": 0, "errors": [],
@@ -705,6 +707,7 @@ class NotionSink:
         task_names = await self.property_names(tasks_ds, KV_TASK_PROP_IDS, self._task_schema(days_ds))
         suffix = with_projects if projects_setup else RENDER_SUFFIX
         for row in rows:
+            heartbeat()
             key = f"{row['chat_id']}:{row['local_date']}"
             try:
                 page_id = row["notion_page_id"] or await self._find_page(days_ds, key, day_names["Key"])

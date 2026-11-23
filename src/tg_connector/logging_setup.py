@@ -1,7 +1,7 @@
 """Logging: stderr (stdout belongs to the MCP stdio protocol) + a rotating file.
 
-A filter masks every known secret value, so a token that leaks into an exception
-message or a library debug line is still never written anywhere.
+The formatter masks every known secret value in the whole formatted record (message, traceback,
+stack), so a token that leaks into an exception or a library debug line is never written anywhere.
 """
 
 from __future__ import annotations
@@ -14,37 +14,30 @@ from logging.handlers import RotatingFileHandler
 from .config import Settings
 
 
-class RedactSecretsFilter(logging.Filter):
-    def __init__(self, secrets: list[str]):
-        super().__init__()
-        self._secrets = sorted(set(secrets), key=len, reverse=True)
+class RedactingFormatter(logging.Formatter):
+    """Masks secrets AFTER formatting: the traceback of `log.exception` is part of the output too."""
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        if not self._secrets:
-            return True
-        message = record.getMessage()
-        redacted = message
+    def __init__(self, fmt: str, datefmt: str, secrets: list[str]):
+        super().__init__(fmt, datefmt)
+        self._secrets = sorted({s for s in secrets if s}, key=len, reverse=True)
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
         for secret in self._secrets:
-            if secret in redacted:
-                redacted = redacted.replace(secret, "***")
-        if redacted != message:
-            record.msg = redacted
-            record.args = ()
-        return True
+            text = text.replace(secret, "***")
+        return text
 
 
 def setup_logging(settings: Settings, level: int = logging.INFO) -> None:
     settings.log_path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
-    redact = RedactSecretsFilter(settings.secret_values())
+    fmt = RedactingFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S",
+                             settings.secret_values())
 
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setFormatter(fmt)
-    stderr_handler.addFilter(redact)
 
     file_handler = RotatingFileHandler(settings.log_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
     file_handler.setFormatter(fmt)
-    file_handler.addFilter(redact)
     os.chmod(settings.log_path, 0o600)
 
     root = logging.getLogger()
